@@ -1,0 +1,7 @@
+.env/
+benchtest
+blobtest
+anntest
+*.db
+*.db-shm
+*.db-wal
