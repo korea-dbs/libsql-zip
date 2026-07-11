@@ -46,6 +46,18 @@
 #include "sqliteInt.h"
 #if SQLITE_OS_UNIX              /* This file is used on unix only */
 
+#ifdef LIBSQL_ENABLE_COMPRESSION
+#  if defined(LIBSQL_COMPRESS_LZ4)
+#    include <lz4.h>
+#  elif defined(LIBSQL_COMPRESS_SNAPPY)
+#    include <snappy-c.h>
+#  elif defined(LIBSQL_COMPRESS_ZSTD)
+#    include <zstd.h>
+#  else
+#    error "LIBSQL_ENABLE_COMPRESSION requires LIBSQL_COMPRESS_LZ4, LIBSQL_COMPRESS_SNAPPY, or LIBSQL_COMPRESS_ZSTD"
+#  endif
+#endif /* LIBSQL_ENABLE_COMPRESSION */
+
 /*
 ** There are various methods for file locking used for concurrency
 ** control:
@@ -267,6 +279,11 @@ struct unixFile {
   const char *zPath;                  /* Name of the file */
   unixShm *pShm;                      /* Shared memory segment information */
   int szChunk;                        /* Configured by FCNTL_CHUNK_SIZE */
+#ifdef LIBSQL_ENABLE_COMPRESSION
+  int zipIdxFd;           /* index file fd; -1 if not using compression */
+  int zipPageSize;        /* page size detected from first write; 0 until known */
+  u32 zipNumPages;        /* number of pages tracked in index */
+#endif
 #if SQLITE_MAX_MMAP_SIZE>0
   int nFetchOut;                      /* Number of outstanding xFetch refs */
   sqlite3_int64 mmapSize;             /* Usable size of mapping at pMapRegion */
@@ -2134,8 +2151,19 @@ static void unixUnmapfile(unixFile *pFd);
 ** even on VxWorks.  A mutex will be acquired on VxWorks by the
 ** vxworksReleaseFileId() routine.
 */
+#ifdef LIBSQL_ENABLE_COMPRESSION
+static int zipCompact(unixFile*);
+#endif
+
 static int closeUnixFile(sqlite3_file *id){
   unixFile *pFile = (unixFile*)id;
+#ifdef LIBSQL_ENABLE_COMPRESSION
+  if( pFile->zipIdxFd >= 0 ){
+    zipCompact(pFile);
+    close(pFile->zipIdxFd);
+    pFile->zipIdxFd = -1;
+  }
+#endif
 #if SQLITE_MAX_MMAP_SIZE>0
   unixUnmapfile(pFile);
 #endif
@@ -3361,6 +3389,304 @@ static int seekAndRead(unixFile *id, sqlite3_int64 offset, void *pBuf, int cnt){
 }
 
 /*
+** VFS-level page compression support.
+**
+** Compile with -DLIBSQL_ENABLE_COMPRESSION and one of:
+**   -DLIBSQL_COMPRESS_LZ4   (link -llz4)
+**   -DLIBSQL_COMPRESS_SNAPPY (link -lsnappy)
+**   -DLIBSQL_COMPRESS_ZSTD  (link -lzstd)
+**
+** Each page of a SQLITE_OPEN_MAIN_DB file is compressed individually.
+** Compressed blocks are appended to the data file (pFile->h).  A
+** sidecar index file ("<db>.zipidx") maps logical page numbers to
+** physical offsets and compressed sizes.
+**
+** Index file layout:
+**   Bytes  0- 7: magic "LIBSQLZP"
+**   Bytes  8-11: page_size (u32)
+**   Bytes 12-15: num_pages (u32)
+**   Bytes 16-23: reserved
+**   Bytes 24+  : 16-byte entries (one per logical page, 0-indexed)
+**                  0- 7: dataOffset (i64) – physical offset in data file
+**                  8-11: compSize   (u32) – compressed byte count
+**                 12-15: flags      (u32) – bit 0: 1=raw, 0=compressed
+**
+** When a page is re-written, the old compressed block becomes dead
+** space in the data file (no compaction is performed).
+*/
+#ifdef LIBSQL_ENABLE_COMPRESSION
+
+#define ZIPIDX_MAGIC  "LIBSQLZP"   /* 8-byte magic */
+#define ZIPIDX_HDR_SZ 24
+#define ZIPIDX_ENT_SZ 16
+
+typedef struct {
+  sqlite3_int64 dataOffset;
+  u32 compSize;
+  u32 flags;                     /* bit 0: 1=raw (stored uncompressed) */
+} ZipIdxEntry;
+
+static int zipMaxCompBound(int pageSize){
+#if defined(LIBSQL_COMPRESS_LZ4)
+  return LZ4_compressBound(pageSize);
+#elif defined(LIBSQL_COMPRESS_SNAPPY)
+  return (int)snappy_max_compressed_length((size_t)pageSize);
+#elif defined(LIBSQL_COMPRESS_ZSTD)
+  return (int)ZSTD_compressBound((size_t)pageSize);
+#endif
+}
+
+static int zipCompress(const void *in, int inSz, void *out, int outCap){
+#if defined(LIBSQL_COMPRESS_LZ4)
+  return LZ4_compress_default((const char*)in, (char*)out, inSz, outCap);
+#elif defined(LIBSQL_COMPRESS_SNAPPY)
+  size_t outLen = (size_t)outCap;
+  return (snappy_compress((const char*)in,(size_t)inSz,
+                          (char*)out,&outLen)==SNAPPY_OK) ? (int)outLen : 0;
+#elif defined(LIBSQL_COMPRESS_ZSTD)
+  size_t r = ZSTD_compress(out,(size_t)outCap,in,(size_t)inSz,1);
+  return ZSTD_isError(r) ? 0 : (int)r;
+#endif
+}
+
+static int zipDecompress(const void *in, int inSz, void *out, int outSz){
+#if defined(LIBSQL_COMPRESS_LZ4)
+  return LZ4_decompress_safe((const char*)in,(char*)out,inSz,outSz);
+#elif defined(LIBSQL_COMPRESS_SNAPPY)
+  size_t outLen = (size_t)outSz;
+  return (snappy_uncompress((const char*)in,(size_t)inSz,
+                            (char*)out,&outLen)==SNAPPY_OK) ? (int)outLen : -1;
+#elif defined(LIBSQL_COMPRESS_ZSTD)
+  size_t r = ZSTD_decompress(out,(size_t)outSz,in,(size_t)inSz);
+  return ZSTD_isError(r) ? -1 : (int)r;
+#endif
+}
+
+static int zipIdxReadHdr(int fd, u32 *pPageSz, u32 *pNumPages){
+  unsigned char buf[ZIPIDX_HDR_SZ];
+  if( pread(fd,buf,ZIPIDX_HDR_SZ,0) != ZIPIDX_HDR_SZ ) return -1;
+  if( memcmp(buf,ZIPIDX_MAGIC,8) != 0 ) return -1;
+  memcpy(pPageSz,   buf+8,  4);
+  memcpy(pNumPages, buf+12, 4);
+  return 0;
+}
+
+static int zipIdxWriteHdr(int fd, u32 pageSz, u32 numPages){
+  unsigned char buf[ZIPIDX_HDR_SZ];
+  memset(buf,0,ZIPIDX_HDR_SZ);
+  memcpy(buf,      ZIPIDX_MAGIC, 8);
+  memcpy(buf+8,    &pageSz,      4);
+  memcpy(buf+12,   &numPages,    4);
+  return (pwrite(fd,buf,ZIPIDX_HDR_SZ,0)==ZIPIDX_HDR_SZ) ? 0 : -1;
+}
+
+static int zipIdxReadEntry(int fd, u32 pgno, ZipIdxEntry *pEnt){
+  unsigned char buf[ZIPIDX_ENT_SZ];
+  off_t off = (off_t)(ZIPIDX_HDR_SZ + (sqlite3_int64)pgno * ZIPIDX_ENT_SZ);
+  if( pread(fd,buf,ZIPIDX_ENT_SZ,off) != ZIPIDX_ENT_SZ ) return -1;
+  memcpy(&pEnt->dataOffset, buf,    8);
+  memcpy(&pEnt->compSize,   buf+8,  4);
+  memcpy(&pEnt->flags,      buf+12, 4);
+  return 0;
+}
+
+static int zipIdxWriteEntry(int fd, u32 pgno, const ZipIdxEntry *pEnt){
+  unsigned char buf[ZIPIDX_ENT_SZ];
+  off_t off = (off_t)(ZIPIDX_HDR_SZ + (sqlite3_int64)pgno * ZIPIDX_ENT_SZ);
+  memcpy(buf,    &pEnt->dataOffset, 8);
+  memcpy(buf+8,  &pEnt->compSize,   4);
+  memcpy(buf+12, &pEnt->flags,      4);
+  return (pwrite(fd,buf,ZIPIDX_ENT_SZ,off)==ZIPIDX_ENT_SZ) ? 0 : -1;
+}
+
+/* Read logical page pgno into pBuf (pageSize bytes). */
+static int zipReadPage(unixFile *pFile, u32 pgno, void *pBuf, int pageSize){
+  if( pgno >= pFile->zipNumPages ){
+    memset(pBuf, 0, pageSize);
+    return SQLITE_IOERR_SHORT_READ;
+  }
+  ZipIdxEntry ent;
+  if( zipIdxReadEntry(pFile->zipIdxFd, pgno, &ent)!=0 || ent.compSize==0 ){
+    memset(pBuf, 0, pageSize);
+    return SQLITE_IOERR_SHORT_READ;
+  }
+  char *tmp = sqlite3_malloc((int)ent.compSize);
+  if( !tmp ) return SQLITE_NOMEM;
+  ssize_t got = pread(pFile->h, tmp, (size_t)ent.compSize, (off_t)ent.dataOffset);
+  if( got != (ssize_t)ent.compSize ){
+    sqlite3_free(tmp);
+    return SQLITE_IOERR_READ;
+  }
+  int rc;
+  if( ent.flags & 1 ){
+    memcpy(pBuf, tmp, pageSize);
+    rc = SQLITE_OK;
+  } else {
+    int r = zipDecompress(tmp, (int)ent.compSize, pBuf, pageSize);
+    rc = (r == pageSize) ? SQLITE_OK : SQLITE_IOERR_READ;
+  }
+  sqlite3_free(tmp);
+  return rc;
+}
+
+/* Compress and append page pgno to the data file; update index. */
+static int zipWritePage(unixFile *pFile, const void *pBuf, u32 pgno, int pageSize){
+  int maxComp = zipMaxCompBound(pageSize);
+  int allocSz = maxComp > pageSize ? maxComp : pageSize;
+  char *tmp = sqlite3_malloc(allocSz);
+  if( !tmp ) return SQLITE_NOMEM;
+
+  u32 flags = 0;
+  int compSz = zipCompress(pBuf, pageSize, tmp, maxComp);
+  if( compSz <= 0 || compSz >= pageSize ){
+    memcpy(tmp, pBuf, pageSize);
+    compSz = pageSize;
+    flags = 1; /* store raw */
+  }
+
+  off_t dataOff = lseek(pFile->h, 0, SEEK_END);
+  if( dataOff < 0 ){
+    sqlite3_free(tmp);
+    pFile->lastErrno = errno;
+    return SQLITE_IOERR_WRITE;
+  }
+
+  ssize_t wrote = pwrite(pFile->h, tmp, (size_t)compSz, dataOff);
+  sqlite3_free(tmp);
+  if( wrote != (ssize_t)compSz ){
+    pFile->lastErrno = errno;
+    return SQLITE_IOERR_WRITE;
+  }
+
+  ZipIdxEntry ent;
+  ent.dataOffset = (sqlite3_int64)dataOff;
+  ent.compSize   = (u32)compSz;
+  ent.flags      = flags;
+  if( zipIdxWriteEntry(pFile->zipIdxFd, pgno, &ent) != 0 ){
+    pFile->lastErrno = errno;
+    return SQLITE_IOERR_WRITE;
+  }
+
+  if( pgno >= pFile->zipNumPages ){
+    pFile->zipNumPages = pgno + 1;
+    if( zipIdxWriteHdr(pFile->zipIdxFd,(u32)pageSize,pFile->zipNumPages)!=0 ){
+      pFile->lastErrno = errno;
+      return SQLITE_IOERR_WRITE;
+    }
+  }
+  return SQLITE_OK;
+}
+
+typedef struct { u32 pgno; sqlite3_int64 oldOff; u32 compSz; u32 flags; } ZipBlock;
+static int zipBlockCmpByOffset(const void *a, const void *b){
+  const ZipBlock *x = (const ZipBlock*)a;
+  const ZipBlock *y = (const ZipBlock*)b;
+  if( x->oldOff < y->oldOff ) return -1;
+  if( x->oldOff > y->oldOff ) return  1;
+  return 0;
+}
+
+/*
+** Compact the data file by rewriting only live (current) compressed blocks
+** in page-number order, then truncating the file.  Called at close time.
+**
+** We process blocks sorted by their OLD offset (ascending) so that the
+** destination offset is always <= the source offset, making in-place
+** rewriting safe without a temporary file.
+*/
+static int zipCompact(unixFile *pFile){
+  u32 numPages = pFile->zipNumPages;
+  int pageSize = pFile->zipPageSize;
+  if( numPages==0 || pageSize==0 ) return SQLITE_OK;
+
+  struct timespec t0, t1;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+
+  /* Build array of (pgno, oldOffset, compSize, flags) sorted by oldOffset. */
+  ZipBlock *blocks = (ZipBlock*)sqlite3_malloc64((u64)numPages * sizeof(ZipBlock));
+  if( !blocks ) return SQLITE_NOMEM;
+
+  u32 liveCount = 0;
+  off_t liveBytes = 0;
+  for( u32 i=0; i<numPages; i++ ){
+    ZipIdxEntry ent;
+    if( zipIdxReadEntry(pFile->zipIdxFd, i, &ent)!=0 || ent.compSize==0 ) continue;
+    blocks[liveCount].pgno   = i;
+    blocks[liveCount].oldOff = ent.dataOffset;
+    blocks[liveCount].compSz = ent.compSize;
+    blocks[liveCount].flags  = ent.flags;
+    liveCount++;
+    liveBytes += ent.compSize;
+  }
+
+  /* Check if compaction is worthwhile (>10% dead space). */
+  off_t fileSize = lseek(pFile->h, 0, SEEK_END);
+  if( fileSize <= 0 || liveBytes >= (off_t)(fileSize * 0.9) ){
+    sqlite3_free(blocks);
+    fprintf(stderr, "ZIPCOMPACT_MS=0.0 BEFORE_MB=%.1f AFTER_MB=%.1f\n",
+            (double)fileSize/1048576.0, (double)fileSize/1048576.0);
+    return SQLITE_OK;
+  }
+
+  /* Sort by ascending oldOff so dst <= src always holds during rewrite. */
+  qsort(blocks, liveCount, sizeof(ZipBlock), zipBlockCmpByOffset);
+
+  int maxBuf = zipMaxCompBound(pageSize);
+  if( maxBuf < pageSize ) maxBuf = pageSize;
+  char *buf = (char*)sqlite3_malloc(maxBuf);
+  if( !buf ){
+    sqlite3_free(blocks);
+    return SQLITE_NOMEM;
+  }
+
+  /* Rewrite live blocks contiguously from offset 0. */
+  off_t newOff = 0;
+  for( u32 i=0; i<liveCount; i++ ){
+    ssize_t got = pread(pFile->h, buf, (size_t)blocks[i].compSz,
+                        (off_t)blocks[i].oldOff);
+    if( got != (ssize_t)blocks[i].compSz ){
+      sqlite3_free(buf);
+      sqlite3_free(blocks);
+      return SQLITE_IOERR_READ;
+    }
+    if( newOff != blocks[i].oldOff ){
+      ssize_t wrote = pwrite(pFile->h, buf, (size_t)blocks[i].compSz, newOff);
+      if( wrote != (ssize_t)blocks[i].compSz ){
+        sqlite3_free(buf);
+        sqlite3_free(blocks);
+        return SQLITE_IOERR_WRITE;
+      }
+    }
+    /* Update index entry with new offset. */
+    ZipIdxEntry ent;
+    ent.dataOffset = (sqlite3_int64)newOff;
+    ent.compSize   = blocks[i].compSz;
+    ent.flags      = blocks[i].flags;
+    zipIdxWriteEntry(pFile->zipIdxFd, blocks[i].pgno, &ent);
+    newOff += (off_t)blocks[i].compSz;
+  }
+
+  sqlite3_free(buf);
+  sqlite3_free(blocks);
+
+  /* Truncate away the dead space. */
+  if( ftruncate(pFile->h, newOff) != 0 ){
+    return SQLITE_IOERR_TRUNCATE;
+  }
+  fdatasync(pFile->h);
+  fdatasync(pFile->zipIdxFd);
+
+  clock_gettime(CLOCK_MONOTONIC, &t1);
+  double elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000.0
+                    + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+  fprintf(stderr, "ZIPCOMPACT_MS=%.1f BEFORE_MB=%.1f AFTER_MB=%.1f\n",
+          elapsed_ms, (double)fileSize/1048576.0, (double)newOff/1048576.0);
+  return SQLITE_OK;
+}
+
+#endif /* LIBSQL_ENABLE_COMPRESSION */
+
+/*
 ** Read data from a file into a buffer.  Return SQLITE_OK if all
 ** bytes were read successfully and SQLITE_IOERR if anything goes
 ** wrong.
@@ -3385,6 +3711,38 @@ static int unixRead(
        || offset+amt<=PENDING_BYTE
   );
 #endif
+
+#ifdef LIBSQL_ENABLE_COMPRESSION
+  if( pFile->zipIdxFd >= 0 ){
+    int pageSize = pFile->zipPageSize;
+    if( pageSize == 0 ){
+      /* No pages written yet – return short read */
+      memset(pBuf, 0, amt);
+      return SQLITE_IOERR_SHORT_READ;
+    }
+    u32 pgno = (u32)(offset / pageSize);
+    int pgOff = (int)(offset % pageSize);
+    if( pgOff == 0 && amt == pageSize ){
+      /* Common case: full page read */
+      return zipReadPage(pFile, pgno, pBuf, pageSize);
+    } else if( (sqlite3_int64)(offset + amt) <= (sqlite3_int64)(pgno + 1) * pageSize ){
+      /* Partial read within one page (e.g. header probe or change counter) */
+      char *full = sqlite3_malloc(pageSize);
+      if( !full ) return SQLITE_NOMEM;
+      int rc = zipReadPage(pFile, pgno, full, pageSize);
+      /* zipReadPage fills full with either page data (OK) or zeros (SHORT_READ) */
+      memcpy(pBuf, full + pgOff, amt);
+      sqlite3_free(full);
+      if( rc == SQLITE_IOERR_SHORT_READ && pgno < pFile->zipNumPages ){
+        rc = SQLITE_OK; /* page exists but is zero – treat as OK */
+      }
+      return rc;
+    } else {
+      /* Read spans page boundary – should not happen for main DB */
+      return SQLITE_IOERR_READ;
+    }
+  }
+#endif /* LIBSQL_ENABLE_COMPRESSION */
 
 #if SQLITE_MAX_MMAP_SIZE>0
   /* Deal with as much of this read request as possible by transferring
@@ -3515,6 +3873,25 @@ static int unixWrite(
        || offset+amt<=PENDING_BYTE
   );
 #endif
+
+#ifdef LIBSQL_ENABLE_COMPRESSION
+  if( pFile->zipIdxFd >= 0 ){
+    /* Infer page size from the first write */
+    if( pFile->zipPageSize == 0 ){
+      if( amt>=512 && amt<=65536 && (amt&(amt-1))==0 ){
+        pFile->zipPageSize = amt;
+        zipIdxWriteHdr(pFile->zipIdxFd, (u32)amt, 0);
+      } else {
+        return SQLITE_IOERR_WRITE;
+      }
+    }
+    if( amt==pFile->zipPageSize && ((int)(offset%pFile->zipPageSize))==0 ){
+      return zipWritePage(pFile, pBuf, (u32)(offset/pFile->zipPageSize),
+                          pFile->zipPageSize);
+    }
+    return SQLITE_IOERR_WRITE;
+  }
+#endif /* LIBSQL_ENABLE_COMPRESSION */
 
 #ifdef SQLITE_DEBUG
   /* If we are doing a normal write to a database file (as opposed to
@@ -3789,6 +4166,14 @@ static int unixSync(sqlite3_file *id, int flags){
     storeLastErrno(pFile, errno);
     return unixLogError(SQLITE_IOERR_FSYNC, "full_fsync", pFile->zPath);
   }
+#ifdef LIBSQL_ENABLE_COMPRESSION
+  if( pFile->zipIdxFd >= 0 ){
+    if( full_fsync(pFile->zipIdxFd, isFullsync, isDataOnly) ){
+      storeLastErrno(pFile, errno);
+      return unixLogError(SQLITE_IOERR_FSYNC, "full_fsync(zipidx)", pFile->zPath);
+    }
+  }
+#endif
 
   /* Also fsync the directory containing the file if the DIRSYNC flag
   ** is set.  This is a one-time occurrence.  Many systems (examples: AIX)
@@ -3819,6 +4204,34 @@ static int unixTruncate(sqlite3_file *id, i64 nByte){
   int rc;
   assert( pFile );
   SimulateIOError( return SQLITE_IOERR_TRUNCATE );
+
+#ifdef LIBSQL_ENABLE_COMPRESSION
+  if( pFile->zipIdxFd >= 0 ){
+    if( nByte == 0 ){
+      /* Full reset: truncate data file and clear index */
+      if( robust_ftruncate(pFile->h, 0) ){
+        storeLastErrno(pFile, errno);
+        return unixLogError(SQLITE_IOERR_TRUNCATE,"ftruncate",pFile->zPath);
+      }
+      pFile->zipNumPages = 0;
+      pFile->zipPageSize = 0;
+      zipIdxWriteHdr(pFile->zipIdxFd, 0, 0);
+      robust_ftruncate(pFile->zipIdxFd, ZIPIDX_HDR_SZ);
+    } else if( pFile->zipPageSize > 0 ){
+      u32 newNum = (u32)(nByte / (i64)pFile->zipPageSize);
+      if( newNum < pFile->zipNumPages ){
+        pFile->zipNumPages = newNum;
+        zipIdxWriteHdr(pFile->zipIdxFd,(u32)pFile->zipPageSize,newNum);
+      }
+    }
+#ifdef SQLITE_DEBUG
+    if( pFile->inNormalWrite && nByte==0 ){
+      pFile->transCntrChng = 1;
+    }
+#endif
+    return SQLITE_OK;
+  }
+#endif /* LIBSQL_ENABLE_COMPRESSION */
 
   /* If the user has configured a chunk-size for this file, truncate the
   ** file so that it consists of an integer number of chunks (i.e. the
@@ -3868,6 +4281,15 @@ static int unixFileSize(sqlite3_file *id, i64 *pSize){
   int rc;
   struct stat buf;
   assert( id );
+#ifdef LIBSQL_ENABLE_COMPRESSION
+  {
+    unixFile *pFile = (unixFile*)id;
+    if( pFile->zipIdxFd >= 0 ){
+      *pSize = (i64)pFile->zipNumPages * (i64)pFile->zipPageSize;
+      return SQLITE_OK;
+    }
+  }
+#endif
   rc = osFstat(((unixFile*)id)->h, &buf);
   SimulateIOError( rc=1 );
   if( rc!=0 ){
@@ -4022,6 +4444,9 @@ static int unixFileControl(sqlite3_file *id, int op, void *pArg){
     }
     case SQLITE_FCNTL_SIZE_HINT: {
       int rc;
+#ifdef LIBSQL_ENABLE_COMPRESSION
+      if( pFile->zipIdxFd >= 0 ) return SQLITE_OK; /* no-op for compressed */
+#endif
       SimulateIOErrorBenign(1);
       rc = fcntlSizeHint(pFile, *(i64 *)pArg);
       SimulateIOErrorBenign(0);
@@ -4069,6 +4494,12 @@ static int unixFileControl(sqlite3_file *id, int op, void *pArg){
     case SQLITE_FCNTL_MMAP_SIZE: {
       i64 newLimit = *(i64*)pArg;
       int rc = SQLITE_OK;
+#ifdef LIBSQL_ENABLE_COMPRESSION
+      if( pFile->zipIdxFd >= 0 ){
+        *(i64*)pArg = 0; /* MMAP disabled for compressed files */
+        return SQLITE_OK;
+      }
+#endif
       if( newLimit>sqlite3GlobalConfig.mxMmap ){
         newLimit = sqlite3GlobalConfig.mxMmap;
       }
@@ -6326,6 +6757,9 @@ static int unixOpen(
     sqlite3_randomness(0,0);
   }
   memset(p, 0, sizeof(unixFile));
+#ifdef LIBSQL_ENABLE_COMPRESSION
+  p->zipIdxFd = -1;
+#endif
 
 #ifdef SQLITE_ASSERT_NO_FILES
   /* Applications that never read or write a persistent disk files */
@@ -6515,6 +6949,29 @@ static int unixOpen(
   rc = fillInUnixFile(pVfs, fd, pFile, zPath, ctrlFlags);
 
 open_finished:
+#ifdef LIBSQL_ENABLE_COMPRESSION
+  if( rc==SQLITE_OK && eType==SQLITE_OPEN_MAIN_DB && zName ){
+    char *zIdxPath = sqlite3_mprintf("%s.zipidx", zName);
+    if( zIdxPath ){
+      int idxFlags = isReadonly ? O_RDONLY : (O_RDWR|O_CREAT);
+      int idxFd = open(zIdxPath, idxFlags, 0644);
+      sqlite3_free(zIdxPath);
+      if( idxFd >= 0 ){
+        p->zipIdxFd = idxFd;
+        u32 ps = 0, np = 0;
+        if( zipIdxReadHdr(idxFd, &ps, &np) == 0 ){
+          p->zipPageSize = (int)ps;
+          p->zipNumPages = np;
+        }
+#if SQLITE_MAX_MMAP_SIZE>0
+        p->mmapSizeMax = 0;  /* disable MMAP for compressed files */
+#endif
+      }
+      /* If open() fails (e.g. read-only and no index yet), leave zipIdxFd=-1
+      ** and operate in normal (uncompressed) mode for this file. */
+    }
+  }
+#endif /* LIBSQL_ENABLE_COMPRESSION */
   if( rc!=SQLITE_OK ){
     sqlite3_free(p->pPreallocatedUnused);
   }

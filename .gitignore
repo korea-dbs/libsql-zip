@@ -16,3 +16,72 @@ libsql-sqlite3/**.o.tmp
 /bindings/c/generated
 /bindings/c/**.xcframework
 /bindings/**/.DS_Store
+
+# Autoconf / libtool build artifacts
+/Makefile
+/Makefile.in.bak
+/config.log
+/config.status
+/libtool
+/sqlite_cfg.h
+/libsql.pc
+/sqlite3.pc
+/has_tclsh84
+/lemon
+/mkkeywordhash
+/mksourceid
+/src-verify
+/.target_source
+
+# Generated C source (amalgamation)
+/sqlite3.c
+/sqlite3.h
+/sqlite3ext.h
+/sqlite3session.h
+/shell.c
+/fts5.c
+/fts5.h
+/fts5parse.c
+/fts5parse.h
+/fts5parse.out
+/fts5parse.sql
+/fts5parse.y
+/parse.c
+/parse.h
+/parse.out
+/parse.sql
+/parse.y
+/opcodes.c
+/opcodes.h
+/keywordhash.h
+/lempar.c
+
+# Compiled objects and libraries
+*.o
+*.lo
+*.la
+/liblibsql.la
+/libsqlite3.la
+/libtclsqlite3.la
+/os_unix.lo
+/os_unix.o
+/sqlite3.lo
+/sqlite3.o
+/tclsqlite.lo
+/tclsqlite.o
+
+# Build output binaries and wrappers
+/libsql
+/libsql-zip
+/libsql-zip-lz4
+/libsql-zip-snappy
+/libsql-zip-zstd
+/sqlite3
+
+# libtool hidden dir and generated source tree
+/.libs/
+/tsrc/
+
+# Benchmark artifacts
+/output.txt
+/benchmark/__pycache__/
