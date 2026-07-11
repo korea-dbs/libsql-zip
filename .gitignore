@@ -70,13 +70,12 @@ libsql-sqlite3/**.o.tmp
 /tclsqlite.lo
 /tclsqlite.o
 
-# Build output binaries and wrappers
+# Build output binaries and wrappers (libtool-generated, path-hardcoded)
 /libsql
 /libsql-zip
-/libsql-zip-lz4
-/libsql-zip-snappy
-/libsql-zip-zstd
 /sqlite3
+# libsql-zip-lz4, libsql-zip-snappy, libsql-zip-zstd are portable wrapper
+# scripts committed to git — do NOT ignore them
 
 # libtool hidden dir and generated source tree
 /.libs/
