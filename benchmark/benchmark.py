@@ -239,7 +239,14 @@ class DiskStatsMonitor:
 
 
 def parse_zipcompact(stderr_text):
-    """Extract ZIPCOMPACT_MS line from stderr; returns (cleaned_stderr, dict or None)."""
+    """Extract ZIPCOMPACT_MS lines from stderr; returns (cleaned_stderr, dict or None).
+
+    zipCompact() now runs once per WAL checkpoint in addition to once at close,
+    so a single run can emit many ZIPCOMPACT_MS lines. Sum the time spent across
+    all of them, track the largest BEFORE_MB seen (peak pre-compaction size,
+    i.e. the worst-case disk usage this run reached) and the AFTER_MB of the
+    last line (final on-disk size), and count how many actually did work.
+    """
     stats = None
     kept = []
     for line in stderr_text.splitlines():
@@ -247,10 +254,65 @@ def parse_zipcompact(stderr_text):
             r"ZIPCOMPACT_MS=([\d.]+)\s+BEFORE_MB=([\d.]+)\s+AFTER_MB=([\d.]+)", line
         )
         if m:
+            ms = float(m.group(1))
+            before_mb = float(m.group(2))
+            after_mb = float(m.group(3))
+            if stats is None:
+                stats = {
+                    "compact_ms": 0.0,
+                    "before_mb": before_mb,
+                    "after_mb": after_mb,
+                    "n_compactions": 0,
+                }
+            stats["compact_ms"] += ms
+            stats["before_mb"] = max(stats["before_mb"], before_mb)
+            stats["after_mb"] = after_mb
+            if ms > 0:
+                stats["n_compactions"] += 1
+        else:
+            kept.append(line)
+    cleaned = "\n".join(kept)
+    if stderr_text.endswith("\n"):
+        cleaned += "\n"
+    return cleaned, stats
+
+
+def parse_ziptime(stderr_text):
+    """Extract ZIPCOMP_MS/ZIPDECOMP_MS line from stderr; returns (cleaned_stderr, dict or None).
+
+    Cumulative time spent inside the page compressor/decompressor for this
+    process (one shell invocation = one Insert phase or one Query phase),
+    as opposed to the normal unixRead/unixWrite I/O time around it.
+    """
+    stats = None
+    kept = []
+    for line in stderr_text.splitlines():
+        m = re.match(
+            r"ZIPCOMP_MS=([\d.]+)\s+ZIPCOMP_N=(\d+)\s+"
+            r"ZIPDECOMP_MS=([\d.]+)\s+ZIPDECOMP_N=(\d+)\s+"
+            r"ZIPNUMPAGES=(\d+)\s+ZIPWRITECALLS=(\d+)\s+ZIPHOLECOUNT=(\d+)\s+"
+            r"ZIPCKPTTOTAL_MS=([\d.]+)\s+ZIPCKPTCOMPACT_MS=([\d.]+)\s+"
+            r"ZIPCLOSECOMPACT_MS=([\d.]+)",
+            line,
+        )
+        if m:
             stats = {
-                "compact_ms": float(m.group(1)),
-                "before_mb":  float(m.group(2)),
-                "after_mb":   float(m.group(3)),
+                "compress_ms":     float(m.group(1)),
+                "compress_n":      int(m.group(2)),
+                "decompress_ms":   float(m.group(3)),
+                "decompress_n":    int(m.group(4)),
+                "num_pages":       int(m.group(5)),
+                "write_calls":     int(m.group(6)),
+                "hole_count":      int(m.group(7)),
+                # Real total time spent inside sqlite3PagerCheckpoint() across
+                # every checkpoint this process ran (lock wait + WAL frame
+                # copy + xSync), not just the VFS-level fsync/compact addition.
+                "ckpt_total_ms":   float(m.group(8)),
+                # Of that total, how much was spent inside zipCompact() when
+                # triggered by a checkpoint, vs. the one forced compaction at
+                # the final close.
+                "ckpt_compact_ms": float(m.group(9)),
+                "close_compact_ms": float(m.group(10)),
             }
         else:
             kept.append(line)
@@ -258,6 +320,17 @@ def parse_zipcompact(stderr_text):
     if stderr_text.endswith("\n"):
         cleaned += "\n"
     return cleaned, stats
+
+
+def format_ziptime_summary(ziptime_stats, phase_time_s):
+    comp_s = ziptime_stats["compress_ms"] / 1000
+    decomp_s = ziptime_stats["decompress_ms"] / 1000
+    comp_pct = comp_s / phase_time_s * 100 if phase_time_s > 0 else 0.0
+    decomp_pct = decomp_s / phase_time_s * 100 if phase_time_s > 0 else 0.0
+    return (
+        f"        Compress={comp_s:.3f}s ({comp_pct:.1f}% of phase, n={ziptime_stats['compress_n']})  "
+        f"Decompress={decomp_s:.3f}s ({decomp_pct:.1f}% of phase, n={ziptime_stats['decompress_n']})"
+    )
 
 
 def parse_time_stats(stderr_text):
@@ -558,6 +631,8 @@ def run_one_config(label, shell, insert_sql_path, query_sql_path,
     result["insert_time_stats"] = {}
     result["ins_stats"] = {}
     result["insert_cpu_eff"] = 0.0
+    result["insert_ziptime"] = None
+    result["query_ziptime"] = None
     result["db_disk_mb"] = 0.0
     result["idx_disk_mb"] = 0.0
     result["total_disk_mb"] = 0.0
@@ -581,6 +656,14 @@ def run_one_config(label, shell, insert_sql_path, query_sql_path,
         result["insert_disk_io"] = insert_mon.stop()
 
         ins_err, compact_stats = parse_zipcompact(ins_err)
+        ins_err, ziptime_stats = parse_ziptime(ins_err)
+        result["insert_ziptime"] = ziptime_stats
+        ckpt_total_ms = ziptime_stats.get("ckpt_total_ms", 0.0) if ziptime_stats else 0.0
+        ckpt_compact_ms = ziptime_stats.get("ckpt_compact_ms", 0.0) if ziptime_stats else 0.0
+        close_compact_ms = ziptime_stats.get("close_compact_ms", 0.0) if ziptime_stats else 0.0
+        result["ckpt_total_s"] = round(ckpt_total_ms / 1000, 2)
+        result["ckpt_compact_s"] = round(ckpt_compact_ms / 1000, 2)
+        result["close_compact_s"] = round(close_compact_ms / 1000, 2)
         err_lines = [l for l in ins_err.splitlines() if l.startswith("Error:")]
         if err_lines:
             print(f"        !! {len(err_lines)} SQL errors during schema/insert:")
@@ -607,14 +690,23 @@ def run_one_config(label, shell, insert_sql_path, query_sql_path,
         insert_only_s = t_insert - compact_s
         if compact_stats and compact_stats["compact_ms"] > 0:
             before_mb = compact_stats["before_mb"]
+            n_compact = compact_stats.get("n_compactions", 0)
             print(
                 f"        insert={insert_only_s:.1f}s  "
-                f"compact={compact_s:.1f}s  "
+                f"compact={compact_s:.1f}s ({n_compact}x)  "
                 f"total={t_insert:.1f}s, "
-                f"{before_mb:.1f} MB → {size_str}"
+                f"peak {before_mb:.1f} MB → {size_str}"
             )
         else:
             print(f"        {t_insert:.1f}s, {size_str}")
+        if ziptime_stats:
+            print(format_ziptime_summary(ziptime_stats, t_insert))
+        if ckpt_total_ms > 0 or close_compact_ms > 0:
+            print(
+                f"        checkpoint total: {result['ckpt_total_s']:.2f}s  |  "
+                f"checkpoint compaction: {result['ckpt_compact_s']:.2f}s  |  "
+                f"close compaction: {result['close_compact_s']:.2f}s"
+            )
         if ins_time:
             real = ins_time.get('real_s', 0)
             user = ins_time.get('user_s', 0)
@@ -680,6 +772,9 @@ def run_one_config(label, shell, insert_sql_path, query_sql_path,
     t_query = time.time() - t0
     result["query_disk_io"] = query_mon.stop()
 
+    q_err, q_ziptime_stats = parse_ziptime(q_err)
+    result["query_ziptime"] = q_ziptime_stats
+
     q_err_lines = [l for l in q_err.splitlines() if l.startswith("Error:")]
     if q_err_lines:
         print(f"        !! {len(q_err_lines)} SQL errors during query:")
@@ -698,6 +793,8 @@ def run_one_config(label, shell, insert_sql_path, query_sql_path,
     q_stats = parse_diskann_stats(q_err)
     result["q_stats"] = q_stats
     print(f"        {t_query:.2f}s ({qps:.0f} q/s), {q} queries returned")
+    if q_ziptime_stats:
+        print(format_ziptime_summary(q_ziptime_stats, t_query))
     if q_time_stats:
         real = q_time_stats.get('real_s', 0)
         user = q_time_stats.get('user_s', 0)
@@ -928,12 +1025,14 @@ If only one compressed variant is present it can simply be named libsql-zip.
     # Summary table
     for ds_name, ds_results in all_results.items():
         ins_hdr = (
-            f"{'Overall':>8} {'Compact':>8} {'Stmt':>8} {'Commit':>8} {'Checkpt':>8} "
+            f"{'Overall':>8} {'Compact':>8} {'CkptTot':>8} {'CkptCpt':>8} {'CloseCpt':>8} "
+            f"{'Stmt':>8} {'Commit':>8} {'Checkpt':>8} "
             f"{'VecBuild':>8} {'Shadow':>8} {'Trav':>8} {'EdgeUpd':>8} "
             f"{'ReadPath':>8} {'WritePath':>9} {'Dist':>8}"
         )
         ins_sub = (
             f"{'(s)':>8} {'(s)':>8} {'(s)':>8} {'(s)':>8} {'(s)':>8} "
+            f"{'(s)':>8} {'(s)':>8} {'(s)':>8} "
             f"{'(s)':>8} {'(s)':>8} {'(s)':>8} {'(s)':>8} "
             f"{'(s)':>8} {'(s)':>9} {'(s)':>8}"
         )
@@ -949,9 +1048,11 @@ If only one compressed variant is present it can simply be named libsql-zip.
         size_sub = f"{'(MB)':>8} {'(MB)':>6} {'(MB)':>8}"
         cpu_hdr  = f"{'CPUi%':>6} {'CPUq%':>6}"
         cpu_sub  = f"{'(eff)':>6} {'(eff)':>6}"
+        zip_hdr  = f"{'IComp':>7} {'IDecomp':>7} {'QComp':>7} {'QDecomp':>7}"
+        zip_sub  = f"{'(s)':>7} {'(s)':>7} {'(s)':>7} {'(s)':>7}"
 
-        hdr = f"{'Config':>20} |{ins_hdr} |{q_hdr} | {size_hdr} | {cpu_hdr}"
-        sub = f"{'':>20} |{ins_sub} |{q_sub} | {size_sub} | {cpu_sub}"
+        hdr = f"{'Config':>20} |{ins_hdr} |{q_hdr} | {size_hdr} | {cpu_hdr} | {zip_hdr}"
+        sub = f"{'':>20} |{ins_sub} |{q_sub} | {size_sub} | {cpu_sub} | {zip_sub}"
         w = len(hdr)
         title = f"SUMMARY: {ds_name} (k={TOP_K})"
         print(f"\n{'='*w}")
@@ -961,7 +1062,8 @@ If only one compressed variant is present it can simply be named libsql-zip.
         q_w = len(q_hdr) + 1
         size_w = len(size_hdr) + 1
         cpu_w = len(cpu_hdr) + 1
-        print(f"{'':>20} |{'--- Insert ---':^{ins_w}} |{'--- Query ---':^{q_w}} | {'--- Disk ---':^{size_w}} | {'-- CPU --':^{cpu_w}}")
+        zip_w = len(zip_hdr) + 1
+        print(f"{'':>20} |{'--- Insert ---':^{ins_w}} |{'--- Query ---':^{q_w}} | {'--- Disk ---':^{size_w}} | {'-- CPU --':^{cpu_w}} | {'-- Compress/Decompress --':^{zip_w}}")
         print(hdr)
         print(sub)
         print(f"{'-'*w}")
@@ -982,9 +1084,15 @@ If only one compressed variant is present it can simply be named libsql-zip.
             ins_cpu_pct = r.get('insert_cpu_eff', float('nan'))
             q_cpu_pct   = r.get('query_cpu_eff', float('nan'))
             compact_s = r.get('compact_s', 0.0)
+            ckpt_total_s = r.get('ckpt_total_s', 0.0)
+            ckpt_compact_s = r.get('ckpt_compact_s', 0.0)
+            close_compact_s = r.get('close_compact_s', 0.0)
             ins_vals = (
                 f"{r['insert_time_s']:>8.1f} "
                 f"{compact_s:>8.1f} "
+                f"{ckpt_total_s:>8.1f} "
+                f"{ckpt_compact_s:>8.1f} "
+                f"{close_compact_s:>8.1f} "
                 f"{stmt_s:>8.1f} {finish_s:>8.1f} {wal_s:>8.1f} "
                 f"{build_s:>8.1f} "
                 f"{shadow_s:>8.1f} {traversal_s:>8.1f} {edge_update_s:>8.1f} "
@@ -1008,7 +1116,15 @@ If only one compressed variant is present it can simply be named libsql-zip.
                 f"{r['idx_disk_mb']:>6.1f} "
                 f"{r['total_disk_mb']:>8.1f}"
             )
-            print(f"{short_label:>20} |{ins_vals} |{q_vals} | {size_vals} | {cpu_vals}")
+            izt = r.get('insert_ziptime') or {}
+            qzt = r.get('query_ziptime') or {}
+            zip_vals = (
+                f"{izt.get('compress_ms', 0)/1000:>7.2f} "
+                f"{izt.get('decompress_ms', 0)/1000:>7.2f} "
+                f"{qzt.get('compress_ms', 0)/1000:>7.2f} "
+                f"{qzt.get('decompress_ms', 0)/1000:>7.2f}"
+            )
+            print(f"{short_label:>20} |{ins_vals} |{q_vals} | {size_vals} | {cpu_vals} | {zip_vals}")
         print(f"{'='*w}")
 
 

@@ -283,6 +283,14 @@ struct unixFile {
   int zipIdxFd;           /* index file fd; -1 if not using compression */
   int zipPageSize;        /* page size detected from first write; 0 until known */
   u32 zipNumPages;        /* number of pages tracked in index */
+  double zipCompressMs;   /* cumulative time spent in zipCompress() */
+  double zipDecompressMs; /* cumulative time spent in zipDecompress() */
+  sqlite3_uint64 zipCompressN;    /* number of zipCompress() calls */
+  sqlite3_uint64 zipDecompressN;  /* number of zipDecompress() calls */
+  sqlite3_uint64 zipWriteCallCount; /* DEBUG: total successful zipWritePage() calls */
+  sqlite3_uint64 zipHoleCount;    /* DEBUG: reads of pgno < zipNumPages with no data */
+  double zipCkptCompactMs;  /* cumulative zipCompact() time triggered by checkpoints */
+  double zipCloseCompactMs; /* zipCompact() time from the final forced close-time call */
 #endif
 #if SQLITE_MAX_MMAP_SIZE>0
   int nFetchOut;                      /* Number of outstanding xFetch refs */
@@ -2152,14 +2160,24 @@ static void unixUnmapfile(unixFile *pFd);
 ** vxworksReleaseFileId() routine.
 */
 #ifdef LIBSQL_ENABLE_COMPRESSION
-static int zipCompact(unixFile*);
+static int zipCompact(unixFile*, int force);
+extern double sqlite3_zipCkptTotalMs;
 #endif
 
 static int closeUnixFile(sqlite3_file *id){
   unixFile *pFile = (unixFile*)id;
 #ifdef LIBSQL_ENABLE_COMPRESSION
   if( pFile->zipIdxFd >= 0 ){
-    zipCompact(pFile);
+    zipCompact(pFile, 1); /* force: always fully compact before final close */
+    fprintf(stderr,
+            "ZIPCOMP_MS=%.3f ZIPCOMP_N=%llu ZIPDECOMP_MS=%.3f ZIPDECOMP_N=%llu "
+            "ZIPNUMPAGES=%u ZIPWRITECALLS=%llu ZIPHOLECOUNT=%llu "
+            "ZIPCKPTTOTAL_MS=%.3f ZIPCKPTCOMPACT_MS=%.3f ZIPCLOSECOMPACT_MS=%.3f\n",
+            pFile->zipCompressMs, (unsigned long long)pFile->zipCompressN,
+            pFile->zipDecompressMs, (unsigned long long)pFile->zipDecompressN,
+            pFile->zipNumPages, (unsigned long long)pFile->zipWriteCallCount,
+            (unsigned long long)pFile->zipHoleCount,
+            sqlite3_zipCkptTotalMs, pFile->zipCkptCompactMs, pFile->zipCloseCompactMs);
     close(pFile->zipIdxFd);
     pFile->zipIdxFd = -1;
   }
@@ -3416,6 +3434,13 @@ static int seekAndRead(unixFile *id, sqlite3_int64 offset, void *pBuf, int cnt){
 */
 #ifdef LIBSQL_ENABLE_COMPRESSION
 
+/* DEBUG: cumulative wall time spent inside sqlite3PagerCheckpoint() (the
+** real, whole-checkpoint duration -- lock wait + WAL frame copy + xSync,
+** not just the VFS-level fsync/compact addition). Incremented from
+** pager.c since that is the single call site for every checkpoint,
+** automatic or explicit. Printed at close alongside the other zip stats. */
+double sqlite3_zipCkptTotalMs = 0;
+
 #define ZIPIDX_MAGIC  "LIBSQLZP"   /* 8-byte magic */
 #define ZIPIDX_HDR_SZ 24
 #define ZIPIDX_ENT_SZ 16
@@ -3507,6 +3532,10 @@ static int zipReadPage(unixFile *pFile, u32 pgno, void *pBuf, int pageSize){
   }
   ZipIdxEntry ent;
   if( zipIdxReadEntry(pFile->zipIdxFd, pgno, &ent)!=0 || ent.compSize==0 ){
+    pFile->zipHoleCount++;
+    if( pFile->zipHoleCount <= 20 ){
+      fprintf(stderr, "ZIPHOLE pgno=%u numPages=%u\n", pgno, pFile->zipNumPages);
+    }
     memset(pBuf, 0, pageSize);
     return SQLITE_IOERR_SHORT_READ;
   }
@@ -3522,7 +3551,13 @@ static int zipReadPage(unixFile *pFile, u32 pgno, void *pBuf, int pageSize){
     memcpy(pBuf, tmp, pageSize);
     rc = SQLITE_OK;
   } else {
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
     int r = zipDecompress(tmp, (int)ent.compSize, pBuf, pageSize);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    pFile->zipDecompressMs += (t1.tv_sec - t0.tv_sec) * 1000.0
+                             + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+    pFile->zipDecompressN++;
     rc = (r == pageSize) ? SQLITE_OK : SQLITE_IOERR_READ;
   }
   sqlite3_free(tmp);
@@ -3537,7 +3572,13 @@ static int zipWritePage(unixFile *pFile, const void *pBuf, u32 pgno, int pageSiz
   if( !tmp ) return SQLITE_NOMEM;
 
   u32 flags = 0;
+  struct timespec t0, t1;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
   int compSz = zipCompress(pBuf, pageSize, tmp, maxComp);
+  clock_gettime(CLOCK_MONOTONIC, &t1);
+  pFile->zipCompressMs += (t1.tv_sec - t0.tv_sec) * 1000.0
+                        + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+  pFile->zipCompressN++;
   if( compSz <= 0 || compSz >= pageSize ){
     memcpy(tmp, pBuf, pageSize);
     compSz = pageSize;
@@ -3574,6 +3615,7 @@ static int zipWritePage(unixFile *pFile, const void *pBuf, u32 pgno, int pageSiz
       return SQLITE_IOERR_WRITE;
     }
   }
+  pFile->zipWriteCallCount++;
   return SQLITE_OK;
 }
 
@@ -3594,7 +3636,7 @@ static int zipBlockCmpByOffset(const void *a, const void *b){
 ** destination offset is always <= the source offset, making in-place
 ** rewriting safe without a temporary file.
 */
-static int zipCompact(unixFile *pFile){
+static int zipCompact(unixFile *pFile, int force){
   u32 numPages = pFile->zipNumPages;
   int pageSize = pFile->zipPageSize;
   if( numPages==0 || pageSize==0 ) return SQLITE_OK;
@@ -3619,9 +3661,13 @@ static int zipCompact(unixFile *pFile){
     liveBytes += ent.compSize;
   }
 
-  /* Check if compaction is worthwhile (>10% dead space). */
+  /* Check if compaction is worthwhile (dead space >= 5x live space, i.e.
+  ** fileSize >= 6x liveBytes), unless forced. Skipping more aggressively
+  ** here trades extra disk headroom for fewer, cheaper checkpoint-time
+  ** compactions; the final close-time compaction (force=1) always runs
+  ** regardless of this guard. */
   off_t fileSize = lseek(pFile->h, 0, SEEK_END);
-  if( fileSize <= 0 || liveBytes >= (off_t)(fileSize * 0.9) ){
+  if( fileSize <= 0 || (!force && fileSize < (off_t)(liveBytes * 6)) ){
     sqlite3_free(blocks);
     fprintf(stderr, "ZIPCOMPACT_MS=0.0 BEFORE_MB=%.1f AFTER_MB=%.1f\n",
             (double)fileSize/1048576.0, (double)fileSize/1048576.0);
@@ -3679,6 +3725,8 @@ static int zipCompact(unixFile *pFile){
   clock_gettime(CLOCK_MONOTONIC, &t1);
   double elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000.0
                     + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+  if( force ) pFile->zipCloseCompactMs += elapsed_ms;
+  else        pFile->zipCkptCompactMs  += elapsed_ms;
   fprintf(stderr, "ZIPCOMPACT_MS=%.1f BEFORE_MB=%.1f AFTER_MB=%.1f\n",
           elapsed_ms, (double)fileSize/1048576.0, (double)newOff/1048576.0);
   return SQLITE_OK;
@@ -4172,6 +4220,14 @@ static int unixSync(sqlite3_file *id, int flags){
       storeLastErrno(pFile, errno);
       return unixLogError(SQLITE_IOERR_FSYNC, "full_fsync(zipidx)", pFile->zPath);
     }
+    /* In WAL mode, xSync on the main DB file only fires at checkpoint
+    ** (see wal.c: walCheckpoint() -> sqlite3OsSync(pWal->pDbFd, ...)).
+    ** Reclaim dead space here instead of waiting until close, so peak
+    ** disk usage is bounded rather than growing for the whole session.
+    ** zipCompact() already no-ops cheaply when dead space is below
+    ** 5x live space. */
+    rc = zipCompact(pFile, 0);
+    if( rc!=SQLITE_OK ) return rc;
   }
 #endif
 
