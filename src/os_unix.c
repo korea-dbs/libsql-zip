@@ -291,6 +291,7 @@ struct unixFile {
   sqlite3_uint64 zipHoleCount;    /* DEBUG: reads of pgno < zipNumPages with no data */
   double zipCkptCompactMs;  /* cumulative zipCompact() time triggered by checkpoints */
   double zipCloseCompactMs; /* zipCompact() time from the final forced close-time call */
+  u8 zipIsMainDb;          /* 1 if this file was opened as SQLITE_OPEN_MAIN_DB */
 #endif
 #if SQLITE_MAX_MMAP_SIZE>0
   int nFetchOut;                      /* Number of outstanding xFetch refs */
@@ -2162,13 +2163,24 @@ static void unixUnmapfile(unixFile *pFd);
 #ifdef LIBSQL_ENABLE_COMPRESSION
 static int zipCompact(unixFile*, int force);
 extern double sqlite3_zipCkptTotalMs;
+#ifdef LIBSQL_ZIP_OFFLINE
+static int zipOfflineCompress(unixFile*);
+#endif
 #endif
 
 static int closeUnixFile(sqlite3_file *id){
   unixFile *pFile = (unixFile*)id;
 #ifdef LIBSQL_ENABLE_COMPRESSION
   if( pFile->zipIdxFd >= 0 ){
-    zipCompact(pFile, 1); /* force: always fully compact before final close */
+#ifndef LIBSQL_ZIP_OFFLINE
+    if( pFile->zipWriteCallCount>0 ){
+      /* force: fully compact before final close, but only if this
+      ** connection actually wrote pages -- a read-only query connection
+      ** closing has nothing to compact and shouldn't pay for a full
+      ** rescan of the file. */
+      zipCompact(pFile, 1);
+    }
+#endif
     fprintf(stderr,
             "ZIPCOMP_MS=%.3f ZIPCOMP_N=%llu ZIPDECOMP_MS=%.3f ZIPDECOMP_N=%llu "
             "ZIPNUMPAGES=%u ZIPWRITECALLS=%llu ZIPHOLECOUNT=%llu "
@@ -2181,6 +2193,14 @@ static int closeUnixFile(sqlite3_file *id){
     close(pFile->zipIdxFd);
     pFile->zipIdxFd = -1;
   }
+#ifdef LIBSQL_ZIP_OFFLINE
+  else if( pFile->zipIsMainDb && !(pFile->ctrlFlags & UNIXFILE_RDONLY) ){
+    /* Plain (never zip-formatted) main db file, writable connection closing:
+    ** this is the end of the insert phase. Compress the whole file now,
+    ** once, in a single pass -- see zipOfflineCompress(). */
+    zipOfflineCompress(pFile);
+  }
+#endif
 #endif
 #if SQLITE_MAX_MMAP_SIZE>0
   unixUnmapfile(pFile);
@@ -3731,6 +3751,105 @@ static int zipCompact(unixFile *pFile, int force){
           elapsed_ms, (double)fileSize/1048576.0, (double)newOff/1048576.0);
   return SQLITE_OK;
 }
+
+#ifdef LIBSQL_ZIP_OFFLINE
+/*
+** "Offline" compression mode: unlike zipCompact() above, which reclaims
+** dead space in a file that was compressed page-by-page as it was
+** written, this function performs the entire page-by-page compression
+** in one pass, once, at the end of the insert phase. Up to this point
+** pFile->zipIdxFd has been -1 the whole time (see unixOpen(): under
+** LIBSQL_ZIP_OFFLINE the .zipidx sidecar is never auto-created), so the
+** file on disk is a plain, ordinary SQLite database. pFile->zipPageSize
+** and pFile->zipNumPages were therefore never set either; the page size
+** is instead read straight out of the standard SQLite file header.
+**
+** Pages are compressed in ascending page-number order and written back
+** into the same file, in place. Because every compressed block is at
+** most pageSize bytes (bigger results are stored raw instead, see
+** zipWritePage()), the cumulative write offset after processing pages
+** [0, pgno) can never exceed pgno*pageSize -- the original start offset
+** of page pgno -- so the in-place rewrite can never clobber page data
+** it hasn't read yet. This is the same dst<=src invariant zipCompact()
+** relies on.
+*/
+static int zipOfflineCompress(unixFile *pFile){
+  unsigned char hdr[100];
+  ssize_t got = pread(pFile->h, hdr, sizeof(hdr), 0);
+  if( got < 100 ) return SQLITE_OK;  /* empty or too-small file: nothing to do */
+
+  int pageSize = (hdr[16]<<8) | hdr[17];
+  if( pageSize == 1 ) pageSize = 65536;
+  if( pageSize < 512 || (pageSize & (pageSize-1))!=0 ) return SQLITE_OK;
+
+  off_t fileSize = lseek(pFile->h, 0, SEEK_END);
+  if( fileSize <= 0 ) return SQLITE_OK;
+  u32 numPages = (u32)(fileSize / pageSize);
+  if( numPages == 0 ) return SQLITE_OK;
+
+  char *zIdxPath = sqlite3_mprintf("%s.zipidx", pFile->zPath);
+  if( !zIdxPath ) return SQLITE_NOMEM;
+  int idxFd = open(zIdxPath, O_RDWR|O_CREAT|O_TRUNC, 0644);
+  sqlite3_free(zIdxPath);
+  if( idxFd < 0 ) return SQLITE_IOERR;
+
+  struct timespec t0, t1;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+
+  int maxComp = zipMaxCompBound(pageSize);
+  int allocSz = maxComp > pageSize ? maxComp : pageSize;
+  char *pageBuf = sqlite3_malloc(pageSize);
+  char *compBuf = sqlite3_malloc(allocSz);
+  if( !pageBuf || !compBuf ){
+    sqlite3_free(pageBuf);
+    sqlite3_free(compBuf);
+    close(idxFd);
+    return SQLITE_NOMEM;
+  }
+
+  off_t newOff = 0;
+  u32 pgno;
+  for( pgno=0; pgno<numPages; pgno++ ){
+    ssize_t r = pread(pFile->h, pageBuf, pageSize, (off_t)pgno * pageSize);
+    if( r != pageSize ) break;
+
+    int compSz = zipCompress(pageBuf, pageSize, compBuf, maxComp);
+    u32 flags = 0;
+    char *src = compBuf;
+    if( compSz <= 0 || compSz >= pageSize ){
+      src = pageBuf;
+      compSz = pageSize;
+      flags = 1;  /* store raw */
+    }
+    ssize_t w = pwrite(pFile->h, src, (size_t)compSz, newOff);
+    if( w != (ssize_t)compSz ) break;
+
+    ZipIdxEntry ent;
+    ent.dataOffset = (sqlite3_int64)newOff;
+    ent.compSize   = (u32)compSz;
+    ent.flags      = flags;
+    zipIdxWriteEntry(idxFd, pgno, &ent);
+    newOff += (off_t)compSz;
+  }
+
+  sqlite3_free(pageBuf);
+  sqlite3_free(compBuf);
+  zipIdxWriteHdr(idxFd, (u32)pageSize, pgno);
+  fdatasync(idxFd);
+  close(idxFd);
+
+  if( ftruncate(pFile->h, newOff) == 0 ){
+    fdatasync(pFile->h);
+  }
+
+  clock_gettime(CLOCK_MONOTONIC, &t1);
+  double elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000.0
+                    + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+  fprintf(stderr, "ZIPOFFLINE_MS=%.1f BEFORE_MB=%.1f AFTER_MB=%.1f NUMPAGES=%u\n",
+          elapsed_ms, (double)fileSize/1048576.0, (double)newOff/1048576.0, pgno);
+  return SQLITE_OK;
+}
+#endif /* LIBSQL_ZIP_OFFLINE */
 
 #endif /* LIBSQL_ENABLE_COMPRESSION */
 
@@ -7007,9 +7126,19 @@ static int unixOpen(
 open_finished:
 #ifdef LIBSQL_ENABLE_COMPRESSION
   if( rc==SQLITE_OK && eType==SQLITE_OPEN_MAIN_DB && zName ){
+    p->zipIsMainDb = 1;
     char *zIdxPath = sqlite3_mprintf("%s.zipidx", zName);
     if( zIdxPath ){
+#ifdef LIBSQL_ZIP_OFFLINE
+      /* Offline mode: never create the sidecar here. Attach to it only if
+      ** a prior zipOfflineCompress() pass (run at the end of the insert
+      ** phase, see closeUnixFile()) already produced one; until then this
+      ** file is read/written as a completely normal, uncompressed SQLite
+      ** database. */
+      int idxFlags = isReadonly ? O_RDONLY : O_RDWR;
+#else
       int idxFlags = isReadonly ? O_RDONLY : (O_RDWR|O_CREAT);
+#endif
       int idxFd = open(zIdxPath, idxFlags, 0644);
       sqlite3_free(zIdxPath);
       if( idxFd >= 0 ){

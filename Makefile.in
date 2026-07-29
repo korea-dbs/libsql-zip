@@ -98,9 +98,18 @@ TCC += $(OPTS)
 # VFS-level page compression.
 # Usage: make LIBSQL_COMPRESS=lz4    (or snappy, or zstd)
 # Each compressed database gets a sidecar <db>.zipidx index file.
+#
+# By default pages are compressed "online", i.e. as each one is written.
+# Add LIBSQL_ZIP_MODE=offline to build the "offline" variant instead:
+# inserts run against a plain, uncompressed database, and the whole file
+# is compressed in a single pass at the end of the insert phase (see
+# zipOfflineCompress() in src/os_unix.c).
 ifdef LIBSQL_COMPRESS
   COMPRESS_UPPER = $(shell echo $(LIBSQL_COMPRESS) | tr '[:lower:]' '[:upper:]')
   TCC += -DLIBSQL_ENABLE_COMPRESSION -DLIBSQL_COMPRESS_$(COMPRESS_UPPER)
+  ifeq ($(LIBSQL_ZIP_MODE),offline)
+    TCC += -DLIBSQL_ZIP_OFFLINE
+  endif
   ifeq ($(LIBSQL_COMPRESS),lz4)
     TLIBS += -llz4
   endif

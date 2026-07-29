@@ -277,6 +277,37 @@ def parse_zipcompact(stderr_text):
     return cleaned, stats
 
 
+def parse_zipoffline(stderr_text):
+    """Extract the ZIPOFFLINE_MS line from stderr; returns (cleaned_stderr, dict or None).
+
+    Only emitted by "offline" zip-mode builds (LIBSQL_ZIP_MODE=offline): a
+    single one-shot whole-file compression pass run at the end of the
+    insert phase (see zipOfflineCompress() in os_unix.c), as opposed to
+    "online" builds which compress incrementally as each page is written.
+    """
+    stats = None
+    kept = []
+    for line in stderr_text.splitlines():
+        m = re.match(
+            r"ZIPOFFLINE_MS=([\d.]+)\s+BEFORE_MB=([\d.]+)\s+AFTER_MB=([\d.]+)\s+"
+            r"NUMPAGES=(\d+)",
+            line,
+        )
+        if m:
+            stats = {
+                "compress_ms": float(m.group(1)),
+                "before_mb": float(m.group(2)),
+                "after_mb": float(m.group(3)),
+                "num_pages": int(m.group(4)),
+            }
+        else:
+            kept.append(line)
+    cleaned = "\n".join(kept)
+    if stderr_text.endswith("\n"):
+        cleaned += "\n"
+    return cleaned, stats
+
+
 def parse_ziptime(stderr_text):
     """Extract ZIPCOMP_MS/ZIPDECOMP_MS line from stderr; returns (cleaned_stderr, dict or None).
 
@@ -608,7 +639,7 @@ def format_io_summary(io_stats):
 def run_one_config(label, shell, insert_sql_path, query_sql_path,
                    gt_results, k, db_dir, do_drop_cache=False,
                    page_size_kb=None, disk_device=DISK_DEVICE,
-                   search_only=False):
+                   search_only=False, zip_mode="online"):
     db_path = os.path.join(db_dir, f"bench_{label}.db")
 
     if not search_only:
@@ -657,10 +688,19 @@ def run_one_config(label, shell, insert_sql_path, query_sql_path,
 
         ins_err, compact_stats = parse_zipcompact(ins_err)
         ins_err, ziptime_stats = parse_ziptime(ins_err)
+        ins_err, offline_stats = parse_zipoffline(ins_err)
         result["insert_ziptime"] = ziptime_stats
-        ckpt_total_ms = ziptime_stats.get("ckpt_total_ms", 0.0) if ziptime_stats else 0.0
-        ckpt_compact_ms = ziptime_stats.get("ckpt_compact_ms", 0.0) if ziptime_stats else 0.0
-        close_compact_ms = ziptime_stats.get("close_compact_ms", 0.0) if ziptime_stats else 0.0
+        result["offline_compress"] = offline_stats
+        if zip_mode == "offline":
+            # Offline builds never do incremental checkpoint-time compaction
+            # (the zip layer isn't engaged until the one-shot compress pass
+            # at the very end of this phase, see zipOfflineCompress()), so
+            # these metrics don't apply -- always 0.
+            ckpt_total_ms = ckpt_compact_ms = close_compact_ms = 0.0
+        else:
+            ckpt_total_ms = ziptime_stats.get("ckpt_total_ms", 0.0) if ziptime_stats else 0.0
+            ckpt_compact_ms = ziptime_stats.get("ckpt_compact_ms", 0.0) if ziptime_stats else 0.0
+            close_compact_ms = ziptime_stats.get("close_compact_ms", 0.0) if ziptime_stats else 0.0
         result["ckpt_total_s"] = round(ckpt_total_ms / 1000, 2)
         result["ckpt_compact_s"] = round(ckpt_compact_ms / 1000, 2)
         result["close_compact_s"] = round(close_compact_ms / 1000, 2)
@@ -675,7 +715,10 @@ def run_one_config(label, shell, insert_sql_path, query_sql_path,
 
         db_mb, idx_mb = total_disk_size_mb(db_path)
         result["insert_time_s"] = round(t_insert, 2)
-        result["compact_s"] = round(compact_stats["compact_ms"] / 1000, 2) if compact_stats else 0.0
+        if zip_mode == "offline":
+            result["compact_s"] = round(offline_stats["compress_ms"] / 1000, 2) if offline_stats else 0.0
+        else:
+            result["compact_s"] = round(compact_stats["compact_ms"] / 1000, 2) if compact_stats else 0.0
         result["db_disk_mb"] = round(db_mb, 1)
         result["idx_disk_mb"] = round(idx_mb, 1)
         result["total_disk_mb"] = round(db_mb + idx_mb, 1)
@@ -688,7 +731,15 @@ def run_one_config(label, shell, insert_sql_path, query_sql_path,
             size_str += f" (data={db_mb:.1f} + idx={idx_mb:.1f})"
         compact_s = result["compact_s"]
         insert_only_s = t_insert - compact_s
-        if compact_stats and compact_stats["compact_ms"] > 0:
+        if zip_mode == "offline" and offline_stats:
+            before_mb = offline_stats["before_mb"]
+            print(
+                f"        insert={insert_only_s:.1f}s (plain)  "
+                f"compress={compact_s:.1f}s (whole-file)  "
+                f"total={t_insert:.1f}s, "
+                f"{before_mb:.1f} MB → {size_str}"
+            )
+        elif compact_stats and compact_stats["compact_ms"] > 0:
             before_mb = compact_stats["before_mb"]
             n_compact = compact_stats.get("n_compactions", 0)
             print(
@@ -701,7 +752,7 @@ def run_one_config(label, shell, insert_sql_path, query_sql_path,
             print(f"        {t_insert:.1f}s, {size_str}")
         if ziptime_stats:
             print(format_ziptime_summary(ziptime_stats, t_insert))
-        if ckpt_total_ms > 0 or close_compact_ms > 0:
+        if zip_mode != "offline" and (ckpt_total_ms > 0 or close_compact_ms > 0):
             print(
                 f"        checkpoint total: {result['ckpt_total_s']:.2f}s  |  "
                 f"checkpoint compaction: {result['ckpt_compact_s']:.2f}s  |  "
@@ -874,12 +925,23 @@ Examples:
   # as libsql-zip-lz4, libsql-zip-snappy, libsql-zip-zstd in --libsql-dir)
   python3 benchmark.py --libsql-dir ../libsql-zip --compressions none,lz4,snappy,zstd
 
+  # "offline" variant: insert uncompressed, compress the whole file once at
+  # the end of the insert phase, then query (build with:
+  # make LIBSQL_COMPRESS=lz4 LIBSQL_ZIP_MODE=offline libsql-zip)
+  python3 benchmark.py --libsql-dir ../libsql-zip --compressions lz4 --mode offline
+
 Shell binary naming convention in --libsql-dir:
   none    -> libsql          (vanilla, no compression)
-  lz4     -> libsql-zip-lz4  (or libsql-zip if only one compressed variant)
-  snappy  -> libsql-zip-snappy
-  zstd    -> libsql-zip-zstd
-If only one compressed variant is present it can simply be named libsql-zip.
+  --mode online (default):
+    lz4     -> libsql-zip-lz4  (or libsql-zip if only one compressed variant)
+    snappy  -> libsql-zip-snappy
+    zstd    -> libsql-zip-zstd
+  --mode offline:
+    lz4     -> libsql-zip-offline-lz4  (or libsql-zip-offline)
+    snappy  -> libsql-zip-offline-snappy
+    zstd    -> libsql-zip-offline-zstd
+If only one compressed variant is present it can simply be named libsql-zip
+(or libsql-zip-offline for --mode offline).
         """,
     )
     parser.add_argument("--libsql-dir", type=str, default=".",
@@ -887,6 +949,12 @@ If only one compressed variant is present it can simply be named libsql-zip.
     parser.add_argument("--compressions", type=str, default="none",
                         help="Comma-separated compression modes to benchmark: "
                              "none,lz4,snappy,zstd (default: none)")
+    parser.add_argument("--mode", type=str, default="online", choices=["online", "offline"],
+                        help="Zip mode: 'online' compresses each page as it's "
+                             "written (default); 'offline' inserts uncompressed "
+                             "and compresses the whole file once at the end of "
+                             "the insert phase (requires binaries built with "
+                             "LIBSQL_ZIP_MODE=offline). No effect for compression=none.")
     parser.add_argument("--dataset-dir", type=str, default=os.path.expanduser("./dataset"),
                         help="Directory with SQL files (default: ./dataset)")
     parser.add_argument("--datasets", type=str, default="sift,glove,coco,cohere",
@@ -924,6 +992,11 @@ If only one compressed variant is present it can simply be named libsql-zip.
         d = args.libsql_dir
         if mode == "none":
             candidates = [os.path.join(d, "libsql"), os.path.join(d, "sqlite3")]
+        elif args.mode == "offline":
+            candidates = [
+                os.path.join(d, f"libsql-zip-offline-{mode}"),
+                os.path.join(d, "libsql-zip-offline"),
+            ]
         else:
             candidates = [
                 os.path.join(d, f"libsql-zip-{mode}"),
@@ -940,10 +1013,16 @@ If only one compressed variant is present it can simply be named libsql-zip.
     for mode in compression_modes:
         shell = resolve_shell(mode)
         if shell is None:
-            print(f"Warning: no binary found for compression='{mode}' in {args.libsql_dir}, skipping")
+            print(f"Warning: no binary found for compression='{mode}' (zip mode={args.mode}) "
+                  f"in {args.libsql_dir}, skipping")
             skipped_modes.append(mode)
             continue
-        label_prefix = "libsql" if mode == "none" else mode
+        if mode == "none":
+            label_prefix = "libsql"
+        elif args.mode == "offline":
+            label_prefix = f"{mode}-offline"
+        else:
+            label_prefix = mode
         for ps_kb in page_sizes_kb:
             configs.append((f"{label_prefix}_{ps_kb}kb", shell, ps_kb))
 
@@ -975,6 +1054,7 @@ If only one compressed variant is present it can simply be named libsql-zip.
 
     print(f"Datasets:     {', '.join(n for n, _, _, _ in datasets)}")
     print(f"Compressions: {', '.join(m for m in compression_modes if m not in skipped_modes)}")
+    print(f"Zip mode:     {args.mode}")
     print(f"Page sizes:   {', '.join(str(x) + ' KB' for x in page_sizes_kb)}")
     print(f"Configs:      {', '.join(cfg[0] for cfg in configs)}")
     print(f"Disk device:  /dev/{disk_device}" + (" (auto)" if args.disk_device == "auto" else ""))
@@ -1008,6 +1088,7 @@ If only one compressed variant is present it can simply be named libsql-zip.
                 page_size_kb=ps_kb,
                 disk_device=disk_device,
                 search_only=args.search_only,
+                zip_mode=args.mode,
             )
             ds_results.append(result)
 
@@ -1025,14 +1106,16 @@ If only one compressed variant is present it can simply be named libsql-zip.
     # Summary table
     for ds_name, ds_results in all_results.items():
         ins_hdr = (
-            f"{'Overall':>8} {'Compact':>8} {'CkptTot':>8} {'CkptCpt':>8} {'CloseCpt':>8} "
-            f"{'Stmt':>8} {'Commit':>8} {'Checkpt':>8} "
+            (f"{'Overall':>8} {'Compress':>8} " if args.mode == "offline"
+             else f"{'Overall':>8} {'Compact':>8} {'CkptTot':>8} {'CkptCpt':>8} {'CloseCpt':>8} ")
+            + f"{'Stmt':>8} {'Commit':>8} {'Checkpt':>8} "
             f"{'VecBuild':>8} {'Shadow':>8} {'Trav':>8} {'EdgeUpd':>8} "
             f"{'ReadPath':>8} {'WritePath':>9} {'Dist':>8}"
         )
         ins_sub = (
-            f"{'(s)':>8} {'(s)':>8} {'(s)':>8} {'(s)':>8} {'(s)':>8} "
-            f"{'(s)':>8} {'(s)':>8} {'(s)':>8} "
+            (f"{'(s)':>8} {'(s)':>8} " if args.mode == "offline"
+             else f"{'(s)':>8} {'(s)':>8} {'(s)':>8} {'(s)':>8} {'(s)':>8} ")
+            + f"{'(s)':>8} {'(s)':>8} {'(s)':>8} "
             f"{'(s)':>8} {'(s)':>8} {'(s)':>8} {'(s)':>8} "
             f"{'(s)':>8} {'(s)':>9} {'(s)':>8}"
         )
@@ -1058,11 +1141,11 @@ If only one compressed variant is present it can simply be named libsql-zip.
         print(f"\n{'='*w}")
         print(f"{title:^{w}}")
         print(f"{'='*w}")
-        ins_w = len(ins_hdr) + 1
-        q_w = len(q_hdr) + 1
-        size_w = len(size_hdr) + 1
-        cpu_w = len(cpu_hdr) + 1
-        zip_w = len(zip_hdr) + 1
+        ins_w = len(ins_hdr)
+        q_w = len(q_hdr)
+        size_w = len(size_hdr)
+        cpu_w = len(cpu_hdr)
+        zip_w = len(zip_hdr)
         print(f"{'':>20} |{'--- Insert ---':^{ins_w}} |{'--- Query ---':^{q_w}} | {'--- Disk ---':^{size_w}} | {'-- CPU --':^{cpu_w}} | {'-- Compress/Decompress --':^{zip_w}}")
         print(hdr)
         print(sub)
@@ -1088,11 +1171,17 @@ If only one compressed variant is present it can simply be named libsql-zip.
             ckpt_compact_s = r.get('ckpt_compact_s', 0.0)
             close_compact_s = r.get('close_compact_s', 0.0)
             ins_vals = (
-                f"{r['insert_time_s']:>8.1f} "
-                f"{compact_s:>8.1f} "
-                f"{ckpt_total_s:>8.1f} "
-                f"{ckpt_compact_s:>8.1f} "
-                f"{close_compact_s:>8.1f} "
+                (
+                    f"{r['insert_time_s']:>8.1f} "
+                    f"{compact_s:>8.1f} "
+                ) if args.mode == "offline" else (
+                    f"{r['insert_time_s']:>8.1f} "
+                    f"{compact_s:>8.1f} "
+                    f"{ckpt_total_s:>8.1f} "
+                    f"{ckpt_compact_s:>8.1f} "
+                    f"{close_compact_s:>8.1f} "
+                )
+            ) + (
                 f"{stmt_s:>8.1f} {finish_s:>8.1f} {wal_s:>8.1f} "
                 f"{build_s:>8.1f} "
                 f"{shadow_s:>8.1f} {traversal_s:>8.1f} {edge_update_s:>8.1f} "
