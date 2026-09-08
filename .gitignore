@@ -84,3 +84,9 @@ libsql-sqlite3/**.o.tmp
 # Benchmark artifacts
 /output.txt
 /benchmark/__pycache__/
+/dataset/
+/full_offline/
+/full_online/
+/ovfl_offline/
+/ovfl_online/
+/.schema_glove_snappy_4kb.sql

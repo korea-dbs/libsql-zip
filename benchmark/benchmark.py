@@ -308,6 +308,100 @@ def parse_zipoffline(stderr_text):
     return cleaned, stats
 
 
+def parse_ovfl_zipcompact(stderr_text):
+    """Same as parse_zipcompact() but for the overflow-only <db>-ovfl store
+    (ZIPOVFLCOMPACT_MS= lines, emitted by zipOvflCompact() in os_unix.c)."""
+    stats = None
+    kept = []
+    for line in stderr_text.splitlines():
+        m = re.match(
+            r"ZIPOVFLCOMPACT_MS=([\d.]+)\s+BEFORE_MB=([\d.]+)\s+AFTER_MB=([\d.]+)", line
+        )
+        if m:
+            ms = float(m.group(1))
+            before_mb = float(m.group(2))
+            after_mb = float(m.group(3))
+            if stats is None:
+                stats = {
+                    "compact_ms": 0.0,
+                    "before_mb": before_mb,
+                    "after_mb": after_mb,
+                    "n_compactions": 0,
+                }
+            stats["compact_ms"] += ms
+            stats["before_mb"] = max(stats["before_mb"], before_mb)
+            stats["after_mb"] = after_mb
+            if ms > 0:
+                stats["n_compactions"] += 1
+        else:
+            kept.append(line)
+    cleaned = "\n".join(kept)
+    if stderr_text.endswith("\n"):
+        cleaned += "\n"
+    return cleaned, stats
+
+
+def parse_ovfl_zipoffline(stderr_text):
+    """Same as parse_zipoffline() but for the overflow-only + offline combo
+    (ZIPOVFLOFFLINE_MS= line, emitted by zipOvflOfflineCompress() in
+    os_unix.c). before_mb/after_mb here cover only the pages that were
+    actually marked overflow and compressed this pass, not the whole file
+    -- ordinary pages are left untouched on disk in this scope."""
+    stats = None
+    kept = []
+    for line in stderr_text.splitlines():
+        m = re.match(
+            r"ZIPOVFLOFFLINE_MS=([\d.]+)\s+BEFORE_MB=([\d.]+)\s+AFTER_MB=([\d.]+)\s+"
+            r"NUMPAGES=(\d+)",
+            line,
+        )
+        if m:
+            stats = {
+                "compress_ms": float(m.group(1)),
+                "before_mb": float(m.group(2)),
+                "after_mb": float(m.group(3)),
+                "num_pages": int(m.group(4)),
+            }
+        else:
+            kept.append(line)
+    cleaned = "\n".join(kept)
+    if stderr_text.endswith("\n"):
+        cleaned += "\n"
+    return cleaned, stats
+
+
+def parse_ovfl_zipmark(stderr_text):
+    """Extract the ZIPOVFLMARK_MS line from stderr; returns (cleaned_stderr, dict or None).
+
+    Isolates the cost of the SQLITE_FCNTL_ZIP_OVFL_MARK/UNMARK classification
+    hook itself (called from btree.c on every overflow-page allocate/free),
+    as distinct from actual compress/decompress or read/write I/O. Only
+    meaningful for zip_scope="ovfl" builds; printed unconditionally by
+    closeUnixFile() whenever any marking happened this connection, even in
+    offline-mode's insert phase where the sidecar fd stays closed the whole
+    time (see zipOvflSetMark() in os_unix.c).
+    """
+    stats = None
+    kept = []
+    for line in stderr_text.splitlines():
+        m = re.match(
+            r"ZIPOVFLMARK_MS=([\d.]+)\s+ZIPOVFLMARK_N=(\d+)\s+ZIPOVFLUNMARK_N=(\d+)",
+            line,
+        )
+        if m:
+            stats = {
+                "mark_ms": float(m.group(1)),
+                "mark_n": int(m.group(2)),
+                "unmark_n": int(m.group(3)),
+            }
+        else:
+            kept.append(line)
+    cleaned = "\n".join(kept)
+    if stderr_text.endswith("\n"):
+        cleaned += "\n"
+    return cleaned, stats
+
+
 def parse_ziptime(stderr_text):
     """Extract ZIPCOMP_MS/ZIPDECOMP_MS line from stderr; returns (cleaned_stderr, dict or None).
 
@@ -343,6 +437,43 @@ def parse_ziptime(stderr_text):
                 # triggered by a checkpoint, vs. the one forced compaction at
                 # the final close.
                 "ckpt_compact_ms": float(m.group(9)),
+                "close_compact_ms": float(m.group(10)),
+            }
+        else:
+            kept.append(line)
+    cleaned = "\n".join(kept)
+    if stderr_text.endswith("\n"):
+        cleaned += "\n"
+    return cleaned, stats
+
+
+def parse_ovfl_ziptime(stderr_text):
+    """Same as parse_ziptime() but for the overflow-only <db>-ovfl store
+    (ZIPOVFL*= line, emitted once per connection close by closeUnixFile()
+    in os_unix.c's LIBSQL_ZIP_OVFL_ONLY block). Same dict shape as
+    parse_ziptime() so callers don't need to branch on scope."""
+    stats = None
+    kept = []
+    for line in stderr_text.splitlines():
+        m = re.match(
+            r"ZIPOVFLCOMP_MS=([\d.]+)\s+ZIPOVFLCOMP_N=(\d+)\s+"
+            r"ZIPOVFLDECOMP_MS=([\d.]+)\s+ZIPOVFLDECOMP_N=(\d+)\s+"
+            r"ZIPOVFLNUMPAGES=(\d+)\s+ZIPOVFLWRITECALLS=(\d+)\s+ZIPOVFLHOLECOUNT=(\d+)\s+"
+            r"ZIPOVFLCKPTTOTAL_MS=([\d.]+)\s+ZIPOVFLCKPTCOMPACT_MS=([\d.]+)\s+"
+            r"ZIPOVFLCLOSECOMPACT_MS=([\d.]+)",
+            line,
+        )
+        if m:
+            stats = {
+                "compress_ms":      float(m.group(1)),
+                "compress_n":       int(m.group(2)),
+                "decompress_ms":    float(m.group(3)),
+                "decompress_n":     int(m.group(4)),
+                "num_pages":        int(m.group(5)),
+                "write_calls":      int(m.group(6)),
+                "hole_count":       int(m.group(7)),
+                "ckpt_total_ms":    float(m.group(8)),
+                "ckpt_compact_ms":  float(m.group(9)),
                 "close_compact_ms": float(m.group(10)),
             }
         else:
@@ -422,7 +553,7 @@ def drop_caches(db_path=None, enabled=True):
     if db_path and hasattr(os, 'posix_fadvise'):
         any_file = False
         evicted = False
-        for suffix in ["", ".zipidx", "-wal", "-shm"]:
+        for suffix in ["", ".zipidx", "-wal", "-shm", "-ovfl", "-ovfl.zipidx"]:
             p = db_path + suffix
             if not os.path.exists(p):
                 continue
@@ -497,15 +628,50 @@ def file_size_mb(path):
         return 0.0
 
 
-def total_disk_size_mb(db_path):
-    """Return combined size of db file and .zipidx sidecar (if present)."""
-    db_bytes = os.path.getsize(db_path) if os.path.exists(db_path) else 0
-    idx_bytes = os.path.getsize(db_path + ".zipidx") if os.path.exists(db_path + ".zipidx") else 0
-    return db_bytes / (1024 * 1024), idx_bytes / (1024 * 1024)
+def disk_usage_bytes(path):
+    """Real on-disk footprint (actual allocated blocks), not the file's
+    apparent/logical size returned by os.path.getsize()/stat().st_size.
+
+    These two differ for the overflow-only zip scope: pages redirected to
+    <db>-ovfl are never physically written into the main db file, but the
+    file is still logically extended (ftruncate) to cover their offset so
+    the pager's page-count math stays correct (see the LIBSQL_ZIP_OVFL_ONLY
+    block in os_unix.c's unixWrite()). That leaves a sparse hole -- counted
+    in st_size, not in st_blocks. st_blocks is always in 512-byte units per
+    POSIX, regardless of the filesystem's actual block size.
+    """
+    try:
+        return os.stat(path).st_blocks * 512
+    except OSError:
+        return 0
+
+
+def total_disk_size_mb(db_path, zip_scope="full"):
+    """Return (db_mb, ovfl_mb, idx_mb): real disk usage of the main db file,
+    of the <db>-ovfl compressed data heap, and of the zip index file. All
+    three are actual disk footprint (see disk_usage_bytes()), not apparent
+    size.
+
+    ovfl_mb is only nonzero for zip_scope="ovfl" (<db>-ovfl); the whole-db
+    scope has no separate data heap since compressed pages live directly in
+    the main db file. idx_mb is <db>-ovfl.zipidx for the ovfl scope, or
+    <db>.zipidx for the whole-db scope -- the two scopes never coexist on
+    the same db_path, so this single field covers both without ambiguity.
+    """
+    db_bytes = disk_usage_bytes(db_path) if os.path.exists(db_path) else 0
+    if zip_scope == "ovfl":
+        ovfl_path = db_path + "-ovfl"
+        idx_path = db_path + "-ovfl.zipidx"
+        ovfl_bytes = disk_usage_bytes(ovfl_path) if os.path.exists(ovfl_path) else 0
+    else:
+        idx_path = db_path + ".zipidx"
+        ovfl_bytes = 0
+    idx_bytes = disk_usage_bytes(idx_path) if os.path.exists(idx_path) else 0
+    return (db_bytes / (1024 * 1024), ovfl_bytes / (1024 * 1024), idx_bytes / (1024 * 1024))
 
 
 def cleanup_db(db_path):
-    for suffix in ["", "-wal", "-shm", "-journal", ".zipidx"]:
+    for suffix in ["", "-wal", "-shm", "-journal", ".zipidx", "-ovfl", "-ovfl.zipidx"]:
         p = db_path + suffix
         if os.path.exists(p):
             os.remove(p)
@@ -639,8 +805,17 @@ def format_io_summary(io_stats):
 def run_one_config(label, shell, insert_sql_path, query_sql_path,
                    gt_results, k, db_dir, do_drop_cache=False,
                    page_size_kb=None, disk_device=DISK_DEVICE,
-                   search_only=False, zip_mode="online"):
+                   search_only=False, zip_mode="online", zip_scope="full"):
     db_path = os.path.join(db_dir, f"bench_{label}.db")
+    # Both parsers produce the same dict shape, so nothing downstream needs
+    # to branch on zip_scope beyond picking which one to call here.
+    compact_parser = parse_ovfl_zipcompact if zip_scope == "ovfl" else parse_zipcompact
+    ziptime_parser = parse_ovfl_ziptime if zip_scope == "ovfl" else parse_ziptime
+    offline_parser = parse_ovfl_zipoffline if zip_scope == "ovfl" else parse_zipoffline
+    # Classification-hook cost only exists for the ovfl scope (MARK/UNMARK
+    # is the mechanism that tells overflow pages apart from ordinary ones);
+    # there's nothing analogous to parse for full-db compression.
+    mark_parser = parse_ovfl_zipmark if zip_scope == "ovfl" else (lambda s: (s, None))
 
     if not search_only:
         cleanup_db(db_path)
@@ -665,15 +840,17 @@ def run_one_config(label, shell, insert_sql_path, query_sql_path,
     result["insert_ziptime"] = None
     result["query_ziptime"] = None
     result["db_disk_mb"] = 0.0
+    result["ovfl_disk_mb"] = 0.0
     result["idx_disk_mb"] = 0.0
     result["total_disk_mb"] = 0.0
     result["query_cpu_eff"] = 0.0
 
     if search_only:
-        db_mb, idx_mb = total_disk_size_mb(db_path)
+        db_mb, ovfl_mb, idx_mb = total_disk_size_mb(db_path, zip_scope)
         result["db_disk_mb"] = round(db_mb, 1)
+        result["ovfl_disk_mb"] = round(ovfl_mb, 1)
         result["idx_disk_mb"] = round(idx_mb, 1)
-        result["total_disk_mb"] = round(db_mb + idx_mb, 1)
+        result["total_disk_mb"] = round(db_mb + ovfl_mb + idx_mb, 1)
         print(f"  Using existing DB: {db_path} ({result['total_disk_mb']:.1f} MB)")
     else:
         print(f"  [1/{n_phases}] Schema + Insert...")
@@ -686,11 +863,13 @@ def run_one_config(label, shell, insert_sql_path, query_sql_path,
         t_insert = time.time() - t0
         result["insert_disk_io"] = insert_mon.stop()
 
-        ins_err, compact_stats = parse_zipcompact(ins_err)
-        ins_err, ziptime_stats = parse_ziptime(ins_err)
-        ins_err, offline_stats = parse_zipoffline(ins_err)
+        ins_err, compact_stats = compact_parser(ins_err)
+        ins_err, ziptime_stats = ziptime_parser(ins_err)
+        ins_err, offline_stats = offline_parser(ins_err)
+        ins_err, mark_stats = mark_parser(ins_err)
         result["insert_ziptime"] = ziptime_stats
         result["offline_compress"] = offline_stats
+        result["insert_mark"] = mark_stats
         if zip_mode == "offline":
             # Offline builds never do incremental checkpoint-time compaction
             # (the zip layer isn't engaged until the one-shot compress pass
@@ -713,21 +892,24 @@ def run_one_config(label, shell, insert_sql_path, query_sql_path,
                 print(f"           ... ({len(err_lines)-5} more)")
             raise RuntimeError(f"schema/insert phase had {len(err_lines)} SQL errors")
 
-        db_mb, idx_mb = total_disk_size_mb(db_path)
+        db_mb, ovfl_mb, idx_mb = total_disk_size_mb(db_path, zip_scope)
         result["insert_time_s"] = round(t_insert, 2)
         if zip_mode == "offline":
             result["compact_s"] = round(offline_stats["compress_ms"] / 1000, 2) if offline_stats else 0.0
         else:
             result["compact_s"] = round(compact_stats["compact_ms"] / 1000, 2) if compact_stats else 0.0
         result["db_disk_mb"] = round(db_mb, 1)
+        result["ovfl_disk_mb"] = round(ovfl_mb, 1)
         result["idx_disk_mb"] = round(idx_mb, 1)
-        result["total_disk_mb"] = round(db_mb + idx_mb, 1)
+        result["total_disk_mb"] = round(db_mb + ovfl_mb + idx_mb, 1)
         result["insert_time_stats"] = ins_time
         ins_stats = parse_diskann_stats(ins_err)
         result["ins_stats"] = ins_stats
 
         size_str = f"{result['total_disk_mb']:.1f} MB"
-        if idx_mb > 0:
+        if zip_scope == "ovfl" and (ovfl_mb > 0 or idx_mb > 0):
+            size_str += f" (db={db_mb:.1f} + ovfl={ovfl_mb:.1f} + idx={idx_mb:.1f})"
+        elif zip_scope != "ovfl" and idx_mb > 0:
             size_str += f" (data={db_mb:.1f} + idx={idx_mb:.1f})"
         compact_s = result["compact_s"]
         insert_only_s = t_insert - compact_s
@@ -750,6 +932,13 @@ def run_one_config(label, shell, insert_sql_path, query_sql_path,
             )
         else:
             print(f"        {t_insert:.1f}s, {size_str}")
+        if mark_stats:
+            mark_pct = (mark_stats["mark_ms"] / 1000 / t_insert * 100) if t_insert > 0 else 0.0
+            print(
+                f"        MarkHook={mark_stats['mark_ms']/1000:.3f}s "
+                f"({mark_pct:.1f}% of phase, "
+                f"mark_n={mark_stats['mark_n']} unmark_n={mark_stats['unmark_n']})"
+            )
         if ziptime_stats:
             print(format_ziptime_summary(ziptime_stats, t_insert))
         if zip_mode != "offline" and (ckpt_total_ms > 0 or close_compact_ms > 0):
@@ -823,8 +1012,10 @@ def run_one_config(label, shell, insert_sql_path, query_sql_path,
     t_query = time.time() - t0
     result["query_disk_io"] = query_mon.stop()
 
-    q_err, q_ziptime_stats = parse_ziptime(q_err)
+    q_err, q_ziptime_stats = ziptime_parser(q_err)
+    q_err, q_mark_stats = mark_parser(q_err)
     result["query_ziptime"] = q_ziptime_stats
+    result["query_mark"] = q_mark_stats
 
     q_err_lines = [l for l in q_err.splitlines() if l.startswith("Error:")]
     if q_err_lines:
@@ -844,6 +1035,13 @@ def run_one_config(label, shell, insert_sql_path, query_sql_path,
     q_stats = parse_diskann_stats(q_err)
     result["q_stats"] = q_stats
     print(f"        {t_query:.2f}s ({qps:.0f} q/s), {q} queries returned")
+    if q_mark_stats:
+        mark_pct = (q_mark_stats["mark_ms"] / 1000 / t_query * 100) if t_query > 0 else 0.0
+        print(
+            f"        MarkHook={q_mark_stats['mark_ms']/1000:.3f}s "
+            f"({mark_pct:.1f}% of phase, "
+            f"mark_n={q_mark_stats['mark_n']} unmark_n={q_mark_stats['unmark_n']})"
+        )
     if q_ziptime_stats:
         print(format_ziptime_summary(q_ziptime_stats, t_query))
     if q_time_stats:
@@ -930,18 +1128,22 @@ Examples:
   # make LIBSQL_COMPRESS=lz4 LIBSQL_ZIP_MODE=offline libsql-zip)
   python3 benchmark.py --libsql-dir ../libsql-zip --compressions lz4 --mode offline
 
-Shell binary naming convention in --libsql-dir:
+  # "overflow-only" variant: only b-tree overflow pages are compressed, into
+  # a separate <db>-ovfl store; ordinary pages stay plain (build with:
+  # make LIBSQL_COMPRESS=lz4 LIBSQL_ZIP_SCOPE=ovfl libsql-zip)
+  python3 benchmark.py --libsql-dir ../libsql-zip --compressions lz4 --zip-scope ovfl
+
+Shell binary naming convention in --libsql-dir (tag = any combination of
+"ovfl-"/"offline-" selected by --zip-scope/--mode, in that order):
   none    -> libsql          (vanilla, no compression)
-  --mode online (default):
-    lz4     -> libsql-zip-lz4  (or libsql-zip if only one compressed variant)
-    snappy  -> libsql-zip-snappy
-    zstd    -> libsql-zip-zstd
-  --mode offline:
-    lz4     -> libsql-zip-offline-lz4  (or libsql-zip-offline)
-    snappy  -> libsql-zip-offline-snappy
-    zstd    -> libsql-zip-offline-zstd
-If only one compressed variant is present it can simply be named libsql-zip
-(or libsql-zip-offline for --mode offline).
+  compressed -> libsql-zip-<tag><algo>  (or libsql-zip-<tag without trailing
+                algo>, e.g. libsql-zip, libsql-zip-offline, libsql-zip-ovfl,
+                libsql-zip-ovfl-offline, if only one algo variant is present)
+
+  --mode online --zip-scope full (default):    libsql-zip-lz4
+  --mode offline --zip-scope full:             libsql-zip-offline-lz4
+  --mode online --zip-scope ovfl:              libsql-zip-ovfl-lz4
+  --mode offline --zip-scope ovfl:             libsql-zip-ovfl-offline-lz4
         """,
     )
     parser.add_argument("--libsql-dir", type=str, default=".",
@@ -955,6 +1157,12 @@ If only one compressed variant is present it can simply be named libsql-zip
                              "and compresses the whole file once at the end of "
                              "the insert phase (requires binaries built with "
                              "LIBSQL_ZIP_MODE=offline). No effect for compression=none.")
+    parser.add_argument("--zip-scope", type=str, default="full", choices=["full", "ovfl"],
+                        help="Compression scope: 'full' compresses every page "
+                             "(default); 'ovfl' compresses only b-tree overflow "
+                             "pages into a separate <db>-ovfl store, leaving "
+                             "ordinary pages plain (requires binaries built with "
+                             "LIBSQL_ZIP_SCOPE=ovfl). No effect for compression=none.")
     parser.add_argument("--dataset-dir", type=str, default=os.path.expanduser("./dataset"),
                         help="Directory with SQL files (default: ./dataset)")
     parser.add_argument("--datasets", type=str, default="sift,glove,coco,cohere",
@@ -983,25 +1191,24 @@ If only one compressed variant is present it can simply be named libsql-zip
         return 1
 
     # Resolve shell binaries for each compression mode.
-    # Naming convention:
-    #   none    -> libsql
-    #   lz4     -> libsql-zip-lz4  (fallback: libsql-zip)
-    #   snappy  -> libsql-zip-snappy (fallback: libsql-zip)
-    #   zstd    -> libsql-zip-zstd   (fallback: libsql-zip)
+    # Naming convention: libsql-zip-<tag><algo>, where <tag> is built from
+    # --zip-scope ("ovfl-" if ovfl) followed by --mode ("offline-" if
+    # offline), in that order -- e.g. "ovfl-offline-" for both combined.
+    # Falls back to the tag-only binary name (no algo suffix) if that's all
+    # that's present, e.g. libsql-zip, libsql-zip-offline, libsql-zip-ovfl.
     def resolve_shell(mode):
         d = args.libsql_dir
         if mode == "none":
             candidates = [os.path.join(d, "libsql"), os.path.join(d, "sqlite3")]
-        elif args.mode == "offline":
-            candidates = [
-                os.path.join(d, f"libsql-zip-offline-{mode}"),
-                os.path.join(d, "libsql-zip-offline"),
-            ]
         else:
-            candidates = [
-                os.path.join(d, f"libsql-zip-{mode}"),
-                os.path.join(d, "libsql-zip"),
-            ]
+            tag = ""
+            if args.zip_scope == "ovfl":
+                tag += "ovfl-"
+            if args.mode == "offline":
+                tag += "offline-"
+            fallback = os.path.join(d, f"libsql-zip-{tag.rstrip('-')}") if tag \
+                else os.path.join(d, "libsql-zip")
+            candidates = [os.path.join(d, f"libsql-zip-{tag}{mode}"), fallback]
         for p in candidates:
             if os.path.isfile(p) and os.access(p, os.X_OK):
                 return p
@@ -1013,16 +1220,20 @@ If only one compressed variant is present it can simply be named libsql-zip
     for mode in compression_modes:
         shell = resolve_shell(mode)
         if shell is None:
-            print(f"Warning: no binary found for compression='{mode}' (zip mode={args.mode}) "
+            print(f"Warning: no binary found for compression='{mode}' "
+                  f"(zip mode={args.mode}, zip scope={args.zip_scope}) "
                   f"in {args.libsql_dir}, skipping")
             skipped_modes.append(mode)
             continue
         if mode == "none":
             label_prefix = "libsql"
-        elif args.mode == "offline":
-            label_prefix = f"{mode}-offline"
         else:
-            label_prefix = mode
+            parts = [mode]
+            if args.zip_scope == "ovfl":
+                parts.append("ovfl")
+            if args.mode == "offline":
+                parts.append("offline")
+            label_prefix = "-".join(parts)
         for ps_kb in page_sizes_kb:
             configs.append((f"{label_prefix}_{ps_kb}kb", shell, ps_kb))
 
@@ -1055,6 +1266,7 @@ If only one compressed variant is present it can simply be named libsql-zip
     print(f"Datasets:     {', '.join(n for n, _, _, _ in datasets)}")
     print(f"Compressions: {', '.join(m for m in compression_modes if m not in skipped_modes)}")
     print(f"Zip mode:     {args.mode}")
+    print(f"Zip scope:    {args.zip_scope}")
     print(f"Page sizes:   {', '.join(str(x) + ' KB' for x in page_sizes_kb)}")
     print(f"Configs:      {', '.join(cfg[0] for cfg in configs)}")
     print(f"Disk device:  /dev/{disk_device}" + (" (auto)" if args.disk_device == "auto" else ""))
@@ -1089,6 +1301,7 @@ If only one compressed variant is present it can simply be named libsql-zip
                 disk_device=disk_device,
                 search_only=args.search_only,
                 zip_mode=args.mode,
+                zip_scope=args.zip_scope,
             )
             ds_results.append(result)
 
@@ -1127,15 +1340,23 @@ If only one compressed variant is present it can simply be named libsql-zip
             f"{'(s)':>8} {'(ms)':>8} {'(ms)':>8} {'(ms)':>8} "
             f"{'(ms)':>8} {'':>8} {'@k':>8}"
         )
-        size_hdr = f"{'DB':>8} {'Idx':>6} {'Total':>8}"
-        size_sub = f"{'(MB)':>8} {'(MB)':>6} {'(MB)':>8}"
+        size_hdr = f"{'DB':>8} {'Ovfl':>8} {'Idx':>8} {'Total':>8}"
+        size_sub = f"{'(MB)':>8} {'(MB)':>8} {'(MB)':>8} {'(MB)':>8}"
         cpu_hdr  = f"{'CPUi%':>6} {'CPUq%':>6}"
         cpu_sub  = f"{'(eff)':>6} {'(eff)':>6}"
         zip_hdr  = f"{'IComp':>7} {'IDecomp':>7} {'QComp':>7} {'QDecomp':>7}"
         zip_sub  = f"{'(s)':>7} {'(s)':>7} {'(s)':>7} {'(s)':>7}"
 
-        hdr = f"{'Config':>20} |{ins_hdr} |{q_hdr} | {size_hdr} | {cpu_hdr} | {zip_hdr}"
-        sub = f"{'':>20} |{ins_sub} |{q_sub} | {size_sub} | {cpu_sub} | {zip_sub}"
+        # Sized to the longest actual label in this dataset's results (e.g.
+        # "snappy-ovfl-offline_4kb" at 23 chars blows past a fixed 20-char
+        # column and desyncs every column after it) with a floor of 20 so
+        # short labels don't shrink the table below its previous width.
+        label_w = max(
+            [20] + [len(r['label'].replace(f"{ds_name}_", "")) for r in ds_results]
+        ) + 1
+
+        hdr = f"{'Config':>{label_w}} |{ins_hdr} |{q_hdr} | {size_hdr} | {cpu_hdr} | {zip_hdr}"
+        sub = f"{'':>{label_w}} |{ins_sub} |{q_sub} | {size_sub} | {cpu_sub} | {zip_sub}"
         w = len(hdr)
         title = f"SUMMARY: {ds_name} (k={TOP_K})"
         print(f"\n{'='*w}")
@@ -1146,7 +1367,7 @@ If only one compressed variant is present it can simply be named libsql-zip
         size_w = len(size_hdr)
         cpu_w = len(cpu_hdr)
         zip_w = len(zip_hdr)
-        print(f"{'':>20} |{'--- Insert ---':^{ins_w}} |{'--- Query ---':^{q_w}} | {'--- Disk ---':^{size_w}} | {'-- CPU --':^{cpu_w}} | {'-- Compress/Decompress --':^{zip_w}}")
+        print(f"{'':>{label_w}} |{'--- Insert ---':^{ins_w}} |{'--- Query ---':^{q_w}} | {'--- Disk ---':^{size_w}} | {'-- CPU --':^{cpu_w}} | {'-- Compress/Decompress --':^{zip_w}}")
         print(hdr)
         print(sub)
         print(f"{'-'*w}")
@@ -1202,7 +1423,8 @@ If only one compressed variant is present it can simply be named libsql-zip
             )
             size_vals = (
                 f"{r['db_disk_mb']:>8.1f} "
-                f"{r['idx_disk_mb']:>6.1f} "
+                f"{r.get('ovfl_disk_mb', 0.0):>8.1f} "
+                f"{r['idx_disk_mb']:>8.1f} "
                 f"{r['total_disk_mb']:>8.1f}"
             )
             izt = r.get('insert_ziptime') or {}
@@ -1213,7 +1435,7 @@ If only one compressed variant is present it can simply be named libsql-zip
                 f"{qzt.get('compress_ms', 0)/1000:>7.2f} "
                 f"{qzt.get('decompress_ms', 0)/1000:>7.2f}"
             )
-            print(f"{short_label:>20} |{ins_vals} |{q_vals} | {size_vals} | {cpu_vals} | {zip_vals}")
+            print(f"{short_label:>{label_w}} |{ins_vals} |{q_vals} | {size_vals} | {cpu_vals} | {zip_vals}")
         print(f"{'='*w}")
 
 

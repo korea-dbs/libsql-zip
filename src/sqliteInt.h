@@ -15,6 +15,16 @@
 #ifndef SQLITEINT_H
 #define SQLITEINT_H
 
+#ifdef LIBSQL_ZIP_OVFL_ONLY
+/* Private sqlite3_file_control() op codes used to notify the VFS's
+** overflow-page-only compression layer (see os_unix.c) at the moment
+** btree.c allocates or frees an overflow page. Values are chosen well
+** above the standard SQLITE_FCNTL_* range (which currently tops out
+** around 42) to avoid any collision with upstream additions. */
+#define SQLITE_FCNTL_ZIP_OVFL_MARK    10101
+#define SQLITE_FCNTL_ZIP_OVFL_UNMARK  10102
+#endif
+
 /* Special Comments:
 **
 ** Some comments have special meaning to the tools that measure test

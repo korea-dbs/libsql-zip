@@ -1,0 +1,3 @@
+#!/bin/bash
+D="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+exec env LD_LIBRARY_PATH="$D/.libs/ovfl-offline-zstd${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$D/.libs/libsql-zip-ovfl-offline-zstd" "$@"

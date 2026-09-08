@@ -292,6 +292,32 @@ struct unixFile {
   double zipCkptCompactMs;  /* cumulative zipCompact() time triggered by checkpoints */
   double zipCloseCompactMs; /* zipCompact() time from the final forced close-time call */
   u8 zipIsMainDb;          /* 1 if this file was opened as SQLITE_OPEN_MAIN_DB */
+#ifdef LIBSQL_ZIP_OVFL_ONLY
+  int zipOvflDataFd;        /* fd of the <db>-ovfl compressed data heap; -1 if unused */
+  int zipOvflIdxFd;         /* fd of the <db>-ovfl.zipidx index; -1 if unused */
+  int zipOvflPageSize;      /* page size, inferred from the first overflow-page write */
+  u32 zipOvflNumPages;      /* number of pages tracked in the overflow index */
+  sqlite3_uint64 zipOvflWriteCallCount; /* DEBUG: successful zipOvflWritePage() calls */
+  sqlite3_uint64 zipOvflHoleCount;      /* DEBUG: reads of a marked pgno with no data */
+  double zipOvflCompressMs, zipOvflDecompressMs;
+  sqlite3_uint64 zipOvflCompressN, zipOvflDecompressN;
+  double zipOvflCkptCompactMs;  /* cumulative zipOvflCompact() time from checkpoints */
+  double zipOvflCloseCompactMs; /* zipOvflCompact() time from the final forced close */
+  /* Per-vfsPgno "is this an overflow page" classification cache, indexed
+  ** directly by vfsPgno (0-based). Values: 0=unknown (never resolved this
+  ** connection), 1=confirmed not overflow, 2=confirmed overflow. Avoids a
+  ** zipIdxReadEntry() disk probe on every single plain page read/write --
+  ** only the first touch of a given pgno per connection pays that cost. */
+  u8 *aOvflClass;
+  u32 nOvflClassAlloc;
+  /* DEBUG: cost of the classification hook itself (SQLITE_FCNTL_ZIP_OVFL_
+  ** MARK/UNMARK, called from btree.c on every overflow-page allocate/free),
+  ** as distinct from the compress/decompress and read/write costs above --
+  ** lets us tell whether hook overhead or actual page I/O dominates a given
+  ** workload's slowdown. */
+  double zipOvflMarkMs;
+  sqlite3_uint64 zipOvflMarkN, zipOvflUnmarkN;
+#endif
 #endif
 #if SQLITE_MAX_MMAP_SIZE>0
   int nFetchOut;                      /* Number of outstanding xFetch refs */
@@ -2166,6 +2192,12 @@ extern double sqlite3_zipCkptTotalMs;
 #ifdef LIBSQL_ZIP_OFFLINE
 static int zipOfflineCompress(unixFile*);
 #endif
+#ifdef LIBSQL_ZIP_OVFL_ONLY
+static int zipOvflCompact(unixFile*, int force);
+#ifdef LIBSQL_ZIP_OFFLINE
+static int zipOvflOfflineCompress(unixFile*);
+#endif
+#endif
 #endif
 
 static int closeUnixFile(sqlite3_file *id){
@@ -2194,12 +2226,61 @@ static int closeUnixFile(sqlite3_file *id){
     pFile->zipIdxFd = -1;
   }
 #ifdef LIBSQL_ZIP_OFFLINE
+#ifdef LIBSQL_ZIP_OVFL_ONLY
+  else if( pFile->zipIsMainDb && !(pFile->ctrlFlags & UNIXFILE_RDONLY) ){
+    /* Overflow-only + offline: the insert phase ran with zero VFS-level
+    ** interception (zipOvflIdxFd stayed -1 the whole time, see unixOpen()),
+    ** so btree.c's mark/unmark hooks only ever updated pFile->aOvflClass in
+    ** memory. Bulk-compress just those marked pages now, once -- see
+    ** zipOvflOfflineCompress() -- instead of the whole file. */
+    zipOvflOfflineCompress(pFile);
+  }
+#else
   else if( pFile->zipIsMainDb && !(pFile->ctrlFlags & UNIXFILE_RDONLY) ){
     /* Plain (never zip-formatted) main db file, writable connection closing:
     ** this is the end of the insert phase. Compress the whole file now,
     ** once, in a single pass -- see zipOfflineCompress(). */
     zipOfflineCompress(pFile);
   }
+#endif
+#endif
+#ifdef LIBSQL_ZIP_OVFL_ONLY
+  if( pFile->zipOvflIdxFd >= 0 ){
+    if( pFile->zipOvflWriteCallCount>0 ){
+      /* Same rationale as the whole-db close-time compact above: only
+      ** force a full rescan if this connection actually wrote overflow
+      ** pages. */
+      zipOvflCompact(pFile, 1);
+    }
+    fprintf(stderr,
+            "ZIPOVFLCOMP_MS=%.3f ZIPOVFLCOMP_N=%llu ZIPOVFLDECOMP_MS=%.3f ZIPOVFLDECOMP_N=%llu "
+            "ZIPOVFLNUMPAGES=%u ZIPOVFLWRITECALLS=%llu ZIPOVFLHOLECOUNT=%llu "
+            "ZIPOVFLCKPTTOTAL_MS=%.3f ZIPOVFLCKPTCOMPACT_MS=%.3f ZIPOVFLCLOSECOMPACT_MS=%.3f\n",
+            pFile->zipOvflCompressMs, (unsigned long long)pFile->zipOvflCompressN,
+            pFile->zipOvflDecompressMs, (unsigned long long)pFile->zipOvflDecompressN,
+            pFile->zipOvflNumPages, (unsigned long long)pFile->zipOvflWriteCallCount,
+            (unsigned long long)pFile->zipOvflHoleCount,
+            sqlite3_zipCkptTotalMs, pFile->zipOvflCkptCompactMs, pFile->zipOvflCloseCompactMs);
+    close(pFile->zipOvflIdxFd);
+    pFile->zipOvflIdxFd = -1;
+    close(pFile->zipOvflDataFd);
+    pFile->zipOvflDataFd = -1;
+  }
+  /* Printed unconditionally (not gated on zipOvflIdxFd>=0): in offline-ovfl
+  ** builds, MARK/UNMARK still fire and accumulate into aOvflClass during
+  ** the insert phase even though zipOvflIdxFd stays -1 the whole time (the
+  ** sidecar isn't opened until zipOvflOfflineCompress() creates it, and
+  ** that doesn't touch pFile->zipOvflIdxFd). This is the only place that
+  ** stat would otherwise go unreported for that case. */
+  if( pFile->zipOvflMarkN>0 || pFile->zipOvflUnmarkN>0 ){
+    fprintf(stderr, "ZIPOVFLMARK_MS=%.3f ZIPOVFLMARK_N=%llu ZIPOVFLUNMARK_N=%llu\n",
+            pFile->zipOvflMarkMs,
+            (unsigned long long)pFile->zipOvflMarkN,
+            (unsigned long long)pFile->zipOvflUnmarkN);
+  }
+  sqlite3_free(pFile->aOvflClass);
+  pFile->aOvflClass = 0;
+  pFile->nOvflClassAlloc = 0;
 #endif
 #endif
 #if SQLITE_MAX_MMAP_SIZE>0
@@ -3752,6 +3833,439 @@ static int zipCompact(unixFile *pFile, int force){
   return SQLITE_OK;
 }
 
+#ifdef LIBSQL_ZIP_OVFL_ONLY
+/*
+** "Overflow-only" compression mode: unlike the whole-database mode above
+** (zipReadPage/zipWritePage/zipCompact, gated on pFile->zipIdxFd), here the
+** main db file stays a normal, plain SQLite file for every ordinary
+** table/index page. Only b-tree *overflow* pages -- identified by btree.c
+** via SQLITE_FCNTL_ZIP_OVFL_MARK/UNMARK, see fillInCell()/clearCellOverflow()
+** -- are compressed and redirected into a completely separate pair of
+** sidecar files, <db>-ovfl (compressed data heap) and <db>-ovfl.zipidx
+** (index), mirroring the layout of the whole-db case one level down.
+**
+** Classification ("is pgno N currently an overflow page") is tracked two
+** ways that must agree:
+**   1. Durably, in the <db>-ovfl.zipidx entries themselves: compSize>0
+**      means "pgno N's real content lives in the ovfl store". This is
+**      what a *new* connection (with an empty in-memory cache) falls back
+**      to on first touch of a given pgno.
+**   2. In pFile->aOvflClass, a per-connection in-memory cache that both
+**      memoizes (1) and additionally captures "marked but not yet
+**      flushed to a checkpoint" pgnos so that this connection's own
+**      unixWrite() calls route correctly before any ovfl.zipidx entry
+**      exists for them. Losing this cache (crash, or simply never having
+**      populated it yet) just means the page falls back to being stored
+**      plain -- never a correctness problem, only a missed compression
+**      opportunity.
+*/
+
+/* Grow pFile->aOvflClass, if needed, so that index vfsPgno is valid. */
+static void zipOvflClassGrow(unixFile *pFile, u32 vfsPgno){
+  if( vfsPgno < pFile->nOvflClassAlloc ) return;
+  u32 newAlloc = vfsPgno + 4096;
+  u8 *p = sqlite3_realloc64(pFile->aOvflClass, newAlloc);
+  if( !p ) return; /* OOM: caller treats an unresolvable pgno as "unknown" */
+  memset(p + pFile->nOvflClassAlloc, 0, newAlloc - pFile->nOvflClassAlloc);
+  pFile->aOvflClass = p;
+  pFile->nOvflClassAlloc = newAlloc;
+}
+
+/* Return true if vfsPgno is currently classified as an overflow page.
+** Resolves and memoizes unknown pgnos from the durable ovfl index. */
+/*
+** pFile->aOvflClass[vfsPgno] values:
+**   0 = unknown (never resolved this connection)
+**   1 = confirmed not an overflow page
+**   2 = confirmed overflow, freshly marked by a write this connection --
+**       not yet durably compressed into the ovfl store. This is the only
+**       state zipOvflOfflineCompress() should act on.
+**   3 = confirmed overflow, resolved by *reading* an already-compressed
+**       durable index entry (written by some earlier write, possibly in a
+**       previous connection). Routing (zipOvflIsMarked()'s return value)
+**       treats this the same as 2, but the offline bulk-compress pass
+**       must leave it alone -- it's already correctly stored, and
+**       re-reading pFile->h at its offset would no longer even be valid
+**       once that page's plain copy has been reclaimed.
+*/
+static int zipOvflIsMarked(unixFile *pFile, u32 vfsPgno){
+  zipOvflClassGrow(pFile, vfsPgno);
+  if( vfsPgno < pFile->nOvflClassAlloc && pFile->aOvflClass[vfsPgno]!=0 ){
+    return pFile->aOvflClass[vfsPgno]==2 || pFile->aOvflClass[vfsPgno]==3;
+  }
+  int isOvfl = 0;
+  if( pFile->zipOvflIdxFd>=0 && vfsPgno<pFile->zipOvflNumPages ){
+    ZipIdxEntry ent;
+    if( zipIdxReadEntry(pFile->zipOvflIdxFd, vfsPgno, &ent)==0 && ent.compSize>0 ){
+      isOvfl = 1;
+    }
+  }
+  if( vfsPgno < pFile->nOvflClassAlloc ){
+    pFile->aOvflClass[vfsPgno] = isOvfl ? 3 : 1;
+  }
+  return isOvfl;
+}
+
+/* Record vfsPgno's classification. When unmarking, also clear any live
+** ovfl-store index entry so its space is picked up as dead by the next
+** zipOvflCompact() pass. */
+static void zipOvflSetMark(unixFile *pFile, u32 vfsPgno, int marked){
+  struct timespec t0, t1;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+
+  zipOvflClassGrow(pFile, vfsPgno);
+  if( vfsPgno < pFile->nOvflClassAlloc ){
+    pFile->aOvflClass[vfsPgno] = marked ? 2 : 1;
+  }
+  if( !marked && pFile->zipOvflIdxFd>=0 && vfsPgno<pFile->zipOvflNumPages ){
+    ZipIdxEntry ent;
+    if( zipIdxReadEntry(pFile->zipOvflIdxFd, vfsPgno, &ent)==0 && ent.compSize>0 ){
+      ent.dataOffset = 0;
+      ent.compSize = 0;
+      ent.flags = 0;
+      zipIdxWriteEntry(pFile->zipOvflIdxFd, vfsPgno, &ent);
+    }
+  }
+
+  clock_gettime(CLOCK_MONOTONIC, &t1);
+  pFile->zipOvflMarkMs += (t1.tv_sec - t0.tv_sec) * 1000.0
+                        + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+  if( marked ) pFile->zipOvflMarkN++;
+  else pFile->zipOvflUnmarkN++;
+}
+
+/* Read logical overflow page vfsPgno into pBuf. Analogous to zipReadPage()
+** but targets the separate <db>-ovfl store instead of pFile->h. */
+static int zipOvflReadPage(unixFile *pFile, u32 vfsPgno, void *pBuf, int pageSize){
+  if( vfsPgno >= pFile->zipOvflNumPages ){
+    memset(pBuf, 0, pageSize);
+    return SQLITE_IOERR_SHORT_READ;
+  }
+  ZipIdxEntry ent;
+  if( zipIdxReadEntry(pFile->zipOvflIdxFd, vfsPgno, &ent)!=0 || ent.compSize==0 ){
+    pFile->zipOvflHoleCount++;
+    memset(pBuf, 0, pageSize);
+    return SQLITE_IOERR_SHORT_READ;
+  }
+  char *tmp = sqlite3_malloc((int)ent.compSize);
+  if( !tmp ) return SQLITE_NOMEM;
+  ssize_t got = pread(pFile->zipOvflDataFd, tmp, (size_t)ent.compSize, (off_t)ent.dataOffset);
+  if( got != (ssize_t)ent.compSize ){
+    sqlite3_free(tmp);
+    return SQLITE_IOERR_READ;
+  }
+  int rc;
+  if( ent.flags & 1 ){
+    memcpy(pBuf, tmp, pageSize);
+    rc = SQLITE_OK;
+  } else {
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    int r = zipDecompress(tmp, (int)ent.compSize, pBuf, pageSize);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    pFile->zipOvflDecompressMs += (t1.tv_sec - t0.tv_sec) * 1000.0
+                                 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+    pFile->zipOvflDecompressN++;
+    rc = (r == pageSize) ? SQLITE_OK : SQLITE_IOERR_READ;
+  }
+  sqlite3_free(tmp);
+  return rc;
+}
+
+/* Compress and append page vfsPgno to the <db>-ovfl data heap; update its
+** index. Analogous to zipWritePage() but targets the separate store. */
+static int zipOvflWritePage(unixFile *pFile, const void *pBuf, u32 vfsPgno, int pageSize){
+  int maxComp = zipMaxCompBound(pageSize);
+  int allocSz = maxComp > pageSize ? maxComp : pageSize;
+  char *tmp = sqlite3_malloc(allocSz);
+  if( !tmp ) return SQLITE_NOMEM;
+
+  u32 flags = 0;
+  struct timespec t0, t1;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+  int compSz = zipCompress(pBuf, pageSize, tmp, maxComp);
+  clock_gettime(CLOCK_MONOTONIC, &t1);
+  pFile->zipOvflCompressMs += (t1.tv_sec - t0.tv_sec) * 1000.0
+                             + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+  pFile->zipOvflCompressN++;
+  if( compSz <= 0 || compSz >= pageSize ){
+    memcpy(tmp, pBuf, pageSize);
+    compSz = pageSize;
+    flags = 1; /* store raw */
+  }
+
+  off_t dataOff = lseek(pFile->zipOvflDataFd, 0, SEEK_END);
+  if( dataOff < 0 ){
+    sqlite3_free(tmp);
+    pFile->lastErrno = errno;
+    return SQLITE_IOERR_WRITE;
+  }
+
+  ssize_t wrote = pwrite(pFile->zipOvflDataFd, tmp, (size_t)compSz, dataOff);
+  sqlite3_free(tmp);
+  if( wrote != (ssize_t)compSz ){
+    pFile->lastErrno = errno;
+    return SQLITE_IOERR_WRITE;
+  }
+
+  ZipIdxEntry ent;
+  ent.dataOffset = (sqlite3_int64)dataOff;
+  ent.compSize   = (u32)compSz;
+  ent.flags      = flags;
+  if( zipIdxWriteEntry(pFile->zipOvflIdxFd, vfsPgno, &ent) != 0 ){
+    pFile->lastErrno = errno;
+    return SQLITE_IOERR_WRITE;
+  }
+
+  if( vfsPgno >= pFile->zipOvflNumPages ){
+    pFile->zipOvflNumPages = vfsPgno + 1;
+    if( zipIdxWriteHdr(pFile->zipOvflIdxFd,(u32)pageSize,pFile->zipOvflNumPages)!=0 ){
+      pFile->lastErrno = errno;
+      return SQLITE_IOERR_WRITE;
+    }
+  }
+  pFile->zipOvflWriteCallCount++;
+  return SQLITE_OK;
+}
+
+/*
+** Compact the <db>-ovfl data heap, exactly the same policy and algorithm
+** as zipCompact() above (checkpoint-triggered, skipped unless dead space
+** is at least 5x live space, unless forced at close). See zipCompact()'s
+** comment for the rationale; kept identical here per design discussion --
+** overflow pages are large so the same ratio-based threshold is expected
+** to behave sensibly without separate tuning.
+*/
+static int zipOvflCompact(unixFile *pFile, int force){
+  u32 numPages = pFile->zipOvflNumPages;
+  int pageSize = pFile->zipOvflPageSize;
+  if( numPages==0 || pageSize==0 ) return SQLITE_OK;
+
+  struct timespec t0, t1;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+
+  ZipBlock *blocks = (ZipBlock*)sqlite3_malloc64((u64)numPages * sizeof(ZipBlock));
+  if( !blocks ) return SQLITE_NOMEM;
+
+  u32 liveCount = 0;
+  off_t liveBytes = 0;
+  for( u32 i=0; i<numPages; i++ ){
+    ZipIdxEntry ent;
+    if( zipIdxReadEntry(pFile->zipOvflIdxFd, i, &ent)!=0 || ent.compSize==0 ) continue;
+    blocks[liveCount].pgno   = i;
+    blocks[liveCount].oldOff = ent.dataOffset;
+    blocks[liveCount].compSz = ent.compSize;
+    blocks[liveCount].flags  = ent.flags;
+    liveCount++;
+    liveBytes += ent.compSize;
+  }
+
+  off_t fileSize = lseek(pFile->zipOvflDataFd, 0, SEEK_END);
+  if( fileSize <= 0 || (!force && fileSize < (off_t)(liveBytes * 6)) ){
+    sqlite3_free(blocks);
+    return SQLITE_OK;
+  }
+
+  qsort(blocks, liveCount, sizeof(ZipBlock), zipBlockCmpByOffset);
+
+  int maxBuf = zipMaxCompBound(pageSize);
+  if( maxBuf < pageSize ) maxBuf = pageSize;
+  char *buf = (char*)sqlite3_malloc(maxBuf);
+  if( !buf ){
+    sqlite3_free(blocks);
+    return SQLITE_NOMEM;
+  }
+
+  off_t newOff = 0;
+  for( u32 i=0; i<liveCount; i++ ){
+    ssize_t got = pread(pFile->zipOvflDataFd, buf, (size_t)blocks[i].compSz,
+                        (off_t)blocks[i].oldOff);
+    if( got != (ssize_t)blocks[i].compSz ){
+      sqlite3_free(buf);
+      sqlite3_free(blocks);
+      return SQLITE_IOERR_READ;
+    }
+    if( newOff != blocks[i].oldOff ){
+      ssize_t wrote = pwrite(pFile->zipOvflDataFd, buf, (size_t)blocks[i].compSz, newOff);
+      if( wrote != (ssize_t)blocks[i].compSz ){
+        sqlite3_free(buf);
+        sqlite3_free(blocks);
+        return SQLITE_IOERR_WRITE;
+      }
+    }
+    ZipIdxEntry ent;
+    ent.dataOffset = (sqlite3_int64)newOff;
+    ent.compSize   = blocks[i].compSz;
+    ent.flags      = blocks[i].flags;
+    zipIdxWriteEntry(pFile->zipOvflIdxFd, blocks[i].pgno, &ent);
+    newOff += (off_t)blocks[i].compSz;
+  }
+
+  sqlite3_free(buf);
+  sqlite3_free(blocks);
+
+  if( ftruncate(pFile->zipOvflDataFd, newOff) != 0 ){
+    return SQLITE_IOERR_TRUNCATE;
+  }
+  fdatasync(pFile->zipOvflDataFd);
+  fdatasync(pFile->zipOvflIdxFd);
+
+  clock_gettime(CLOCK_MONOTONIC, &t1);
+  double elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000.0
+                    + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+  if( force ) pFile->zipOvflCloseCompactMs += elapsed_ms;
+  else        pFile->zipOvflCkptCompactMs  += elapsed_ms;
+  fprintf(stderr, "ZIPOVFLCOMPACT_MS=%.1f BEFORE_MB=%.1f AFTER_MB=%.1f\n",
+          elapsed_ms, (double)fileSize/1048576.0, (double)newOff/1048576.0);
+  return SQLITE_OK;
+}
+
+#ifdef LIBSQL_ZIP_OFFLINE
+/*
+** "Offline" counterpart of the overflow-only scheme above: during the
+** insert phase, zipOvflIdxFd stays -1 the whole time (see unixOpen(): the
+** sidecar is only ever *attached to*, never created, while
+** LIBSQL_ZIP_OFFLINE is defined) so every unixWrite()/unixRead() call on
+** the main db file falls straight through to plain I/O, at zero extra
+** cost. btree.c's mark/unmark hooks still fire on every overflow page
+** allocation/free, but with no sidecar open yet they only update
+** pFile->aOvflClass in memory (see the FCNTL_ZIP_OVFL_MARK/UNMARK cases in
+** unixFileControl()).
+**
+** This function runs once, at the end of the insert phase (from
+** closeUnixFile()): it walks that in-memory classification, and for each
+** pgno marked "overflow" reads the page's still-plain bytes straight out
+** of the main db file, compresses them into a freshly-created <db>-ovfl +
+** <db>-ovfl.zipidx pair (created here, matching the online scheme's
+** on-disk format so a later connection's unixOpen()/unixRead() can attach
+** to and read it transparently), and punches a hole over the page's old
+** plain bytes in the main file to reclaim the space. Ordinary pages are
+** left completely untouched -- unlike zipOfflineCompress(), this is not a
+** whole-file rewrite.
+*/
+static int zipOvflOfflineCompress(unixFile *pFile){
+  if( pFile->aOvflClass==0 || pFile->nOvflClassAlloc==0 ){
+    return SQLITE_OK; /* nothing was ever marked overflow this connection */
+  }
+
+  unsigned char hdr[100];
+  ssize_t got = pread(pFile->h, hdr, sizeof(hdr), 0);
+  if( got < 100 ) return SQLITE_OK;
+
+  int pageSize = (hdr[16]<<8) | hdr[17];
+  if( pageSize == 1 ) pageSize = 65536;
+  if( pageSize < 512 || (pageSize & (pageSize-1))!=0 ) return SQLITE_OK;
+
+  off_t fileSize = lseek(pFile->h, 0, SEEK_END);
+  if( fileSize <= 0 ) return SQLITE_OK;
+  u32 numPages = (u32)(fileSize / pageSize);
+  if( numPages == 0 ) return SQLITE_OK;
+
+  char *zDataPath = sqlite3_mprintf("%s-ovfl", pFile->zPath);
+  char *zIdxPath  = sqlite3_mprintf("%s-ovfl.zipidx", pFile->zPath);
+  if( !zDataPath || !zIdxPath ){
+    sqlite3_free(zDataPath);
+    sqlite3_free(zIdxPath);
+    return SQLITE_NOMEM;
+  }
+  /* O_CREAT without O_TRUNC: if a prior close in this same insert phase
+  ** already produced a sidecar (shouldn't normally happen for this
+  ** benchmark's single-connection-per-phase usage, but stay correct if it
+  ** does), attach to it and append rather than clobbering it. */
+  int dataFd = open(zDataPath, O_RDWR|O_CREAT, 0644);
+  int idxFd  = open(zIdxPath, O_RDWR|O_CREAT, 0644);
+  sqlite3_free(zDataPath);
+  sqlite3_free(zIdxPath);
+  if( dataFd<0 || idxFd<0 ){
+    if( dataFd>=0 ) close(dataFd);
+    if( idxFd>=0 ) close(idxFd);
+    return SQLITE_IOERR;
+  }
+  u32 existingPageSize = 0, existingNumPages = 0;
+  zipIdxReadHdr(idxFd, &existingPageSize, &existingNumPages); /* ok if absent */
+
+  struct timespec t0, t1;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+
+  int maxComp = zipMaxCompBound(pageSize);
+  int allocSz = maxComp > pageSize ? maxComp : pageSize;
+  char *pageBuf = sqlite3_malloc(pageSize);
+  char *compBuf = sqlite3_malloc(allocSz);
+  if( !pageBuf || !compBuf ){
+    sqlite3_free(pageBuf);
+    sqlite3_free(compBuf);
+    close(dataFd);
+    close(idxFd);
+    return SQLITE_NOMEM;
+  }
+
+  off_t newOff = lseek(dataFd, 0, SEEK_END);
+  if( newOff < 0 ) newOff = 0;
+  off_t startOff = newOff;
+  u32 nCompressed = 0;
+  u32 highestPgno = existingNumPages;
+
+  u32 limit = numPages < pFile->nOvflClassAlloc ? numPages : pFile->nOvflClassAlloc;
+  for( u32 pgno=0; pgno<limit; pgno++ ){
+    if( pFile->aOvflClass[pgno] != 2 ) continue; /* not marked overflow */
+
+    ssize_t r = pread(pFile->h, pageBuf, pageSize, (off_t)pgno * pageSize);
+    if( r != pageSize ) continue; /* nothing there (short read / hole) */
+
+    int compSz = zipCompress(pageBuf, pageSize, compBuf, maxComp);
+    u32 flags = 0;
+    char *src = compBuf;
+    if( compSz <= 0 || compSz >= pageSize ){
+      src = pageBuf;
+      compSz = pageSize;
+      flags = 1; /* store raw */
+    }
+    ssize_t w = pwrite(dataFd, src, (size_t)compSz, newOff);
+    if( w != (ssize_t)compSz ) continue;
+
+    ZipIdxEntry ent;
+    ent.dataOffset = (sqlite3_int64)newOff;
+    ent.compSize   = (u32)compSz;
+    ent.flags      = flags;
+    zipIdxWriteEntry(idxFd, pgno, &ent);
+    newOff += (off_t)compSz;
+    nCompressed++;
+    if( pgno+1 > highestPgno ) highestPgno = pgno+1;
+
+    /* Reclaim the now-redundant plain copy's space in the main db file.
+    ** Best-effort: if the filesystem doesn't support hole-punching, the
+    ** plain bytes just stay put -- a missed space saving, not a
+    ** correctness problem, since reads are now served from the sidecar
+    ** regardless (see unixRead()'s classification check). */
+#ifdef FALLOC_FL_PUNCH_HOLE
+    fallocate(pFile->h, FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE,
+              (off_t)pgno * pageSize, pageSize);
+#endif
+  }
+
+  sqlite3_free(pageBuf);
+  sqlite3_free(compBuf);
+  if( highestPgno > existingNumPages ){
+    zipIdxWriteHdr(idxFd, (u32)pageSize, highestPgno);
+  }
+  fdatasync(dataFd);
+  fdatasync(idxFd);
+  close(dataFd);
+  close(idxFd);
+
+  clock_gettime(CLOCK_MONOTONIC, &t1);
+  double elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000.0
+                    + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+  fprintf(stderr, "ZIPOVFLOFFLINE_MS=%.1f BEFORE_MB=%.1f AFTER_MB=%.1f NUMPAGES=%u\n",
+          elapsed_ms,
+          (double)((sqlite3_int64)nCompressed * pageSize)/1048576.0,
+          (double)(newOff-startOff)/1048576.0,
+          nCompressed);
+  return SQLITE_OK;
+}
+#endif /* LIBSQL_ZIP_OFFLINE */
+#endif /* LIBSQL_ZIP_OVFL_ONLY */
+
 #ifdef LIBSQL_ZIP_OFFLINE
 /*
 ** "Offline" compression mode: unlike zipCompact() above, which reclaims
@@ -3909,6 +4423,30 @@ static int unixRead(
       return SQLITE_IOERR_READ;
     }
   }
+#ifdef LIBSQL_ZIP_OVFL_ONLY
+  if( pFile->zipOvflIdxFd >= 0 && pFile->zipOvflPageSize>0 ){
+    int pageSize = pFile->zipOvflPageSize;
+    u32 vfsPgno = (u32)(offset / pageSize);
+    int pgOff = (int)(offset % pageSize);
+    if( pgOff==0 && amt==pageSize ){
+      if( zipOvflIsMarked(pFile, vfsPgno) ){
+        return zipOvflReadPage(pFile, vfsPgno, pBuf, pageSize);
+      }
+      /* Not an overflow page: fall through to the plain read below. */
+    } else if( (sqlite3_int64)(offset + amt) <= (sqlite3_int64)(vfsPgno + 1) * pageSize
+            && zipOvflIsMarked(pFile, vfsPgno) ){
+      char *full = sqlite3_malloc(pageSize);
+      if( !full ) return SQLITE_NOMEM;
+      int rc = zipOvflReadPage(pFile, vfsPgno, full, pageSize);
+      memcpy(pBuf, full + pgOff, amt);
+      sqlite3_free(full);
+      if( rc == SQLITE_IOERR_SHORT_READ && vfsPgno < pFile->zipOvflNumPages ){
+        rc = SQLITE_OK;
+      }
+      return rc;
+    }
+  }
+#endif /* LIBSQL_ZIP_OVFL_ONLY */
 #endif /* LIBSQL_ENABLE_COMPRESSION */
 
 #if SQLITE_MAX_MMAP_SIZE>0
@@ -4058,6 +4596,30 @@ static int unixWrite(
     }
     return SQLITE_IOERR_WRITE;
   }
+#ifdef LIBSQL_ZIP_OVFL_ONLY
+  if( pFile->zipOvflIdxFd >= 0
+   && amt>=512 && amt<=65536 && (amt&(amt-1))==0
+   && ((sqlite3_int64)(offset%amt))==0
+  ){
+    u32 vfsPgno = (u32)(offset/amt);
+    if( zipOvflIsMarked(pFile, vfsPgno) ){
+      if( pFile->zipOvflPageSize==0 ) pFile->zipOvflPageSize = amt;
+      int rc = zipOvflWritePage(pFile, pBuf, vfsPgno, amt);
+      if( rc==SQLITE_OK ){
+        /* This page's real bytes never land in pFile->h -- make sure the
+        ** main file's apparent size still tracks the highest pgno ever
+        ** touched, in case this overflow page turns out to be the last
+        ** page in the database (see design note in zipOvflWritePage's
+        ** block comment above). */
+        off_t curSize = lseek(pFile->h, 0, SEEK_END);
+        off_t needed = (off_t)(vfsPgno+1) * amt;
+        if( curSize>=0 && curSize<needed ) ftruncate(pFile->h, needed);
+      }
+      return rc;
+    }
+    /* Not an overflow page: fall through to the plain write below. */
+  }
+#endif /* LIBSQL_ZIP_OVFL_ONLY */
 #endif /* LIBSQL_ENABLE_COMPRESSION */
 
 #ifdef SQLITE_DEBUG
@@ -4348,6 +4910,18 @@ static int unixSync(sqlite3_file *id, int flags){
     rc = zipCompact(pFile, 0);
     if( rc!=SQLITE_OK ) return rc;
   }
+#ifdef LIBSQL_ZIP_OVFL_ONLY
+  if( pFile->zipOvflIdxFd >= 0 ){
+    if( full_fsync(pFile->zipOvflIdxFd, isFullsync, isDataOnly)
+     || full_fsync(pFile->zipOvflDataFd, isFullsync, isDataOnly)
+    ){
+      storeLastErrno(pFile, errno);
+      return unixLogError(SQLITE_IOERR_FSYNC, "full_fsync(ovflidx)", pFile->zPath);
+    }
+    rc = zipOvflCompact(pFile, 0);
+    if( rc!=SQLITE_OK ) return rc;
+  }
+#endif
 #endif
 
   /* Also fsync the directory containing the file if the DIRSYNC flag
@@ -4590,6 +5164,23 @@ static int unixGetTempname(int nBuf, char *zBuf);
 static int unixFileControl(sqlite3_file *id, int op, void *pArg){
   unixFile *pFile = (unixFile*)id;
   switch( op ){
+#ifdef LIBSQL_ZIP_OVFL_ONLY
+    case SQLITE_FCNTL_ZIP_OVFL_MARK: {
+      /* Not gated on zipOvflIdxFd>=0: in offline-ovfl builds the sidecar
+      ** isn't open yet during the insert phase, but classification still
+      ** needs to accumulate in pFile->aOvflClass for the close-time bulk
+      ** pass (zipOvflOfflineCompress()) to consult. zipOvflSetMark() itself
+      ** already no-ops the idx-clearing part when there's no sidecar yet. */
+      u32 pgno = *(u32*)pArg;
+      zipOvflSetMark(pFile, pgno - 1, 1);
+      return SQLITE_OK;
+    }
+    case SQLITE_FCNTL_ZIP_OVFL_UNMARK: {
+      u32 pgno = *(u32*)pArg;
+      zipOvflSetMark(pFile, pgno - 1, 0);
+      return SQLITE_OK;
+    }
+#endif
 #if defined(__linux__) && defined(SQLITE_ENABLE_BATCH_ATOMIC_WRITE)
     case SQLITE_FCNTL_BEGIN_ATOMIC_WRITE: {
       int rc = osIoctl(pFile->h, F2FS_IOC_START_ATOMIC_WRITE);
@@ -4674,6 +5265,12 @@ static int unixFileControl(sqlite3_file *id, int op, void *pArg){
         *(i64*)pArg = 0; /* MMAP disabled for compressed files */
         return SQLITE_OK;
       }
+#ifdef LIBSQL_ZIP_OVFL_ONLY
+      if( pFile->zipOvflIdxFd >= 0 ){
+        *(i64*)pArg = 0; /* MMAP would bypass overflow-page classification */
+        return SQLITE_OK;
+      }
+#endif
 #endif
       if( newLimit>sqlite3GlobalConfig.mxMmap ){
         newLimit = sqlite3GlobalConfig.mxMmap;
@@ -6934,6 +7531,10 @@ static int unixOpen(
   memset(p, 0, sizeof(unixFile));
 #ifdef LIBSQL_ENABLE_COMPRESSION
   p->zipIdxFd = -1;
+#ifdef LIBSQL_ZIP_OVFL_ONLY
+  p->zipOvflDataFd = -1;
+  p->zipOvflIdxFd = -1;
+#endif
 #endif
 
 #ifdef SQLITE_ASSERT_NO_FILES
@@ -7127,6 +7728,52 @@ open_finished:
 #ifdef LIBSQL_ENABLE_COMPRESSION
   if( rc==SQLITE_OK && eType==SQLITE_OPEN_MAIN_DB && zName ){
     p->zipIsMainDb = 1;
+#ifdef LIBSQL_ZIP_OVFL_ONLY
+    /* Overflow-only mode: the main db file itself stays plain (regular
+    ** pages are never routed through pFile->h's zipIdxFd, which stays -1
+    ** here on purpose). Only the separate <db>-ovfl data heap and its
+    ** <db>-ovfl.zipidx index get opened. */
+    {
+      char *zDataPath = sqlite3_mprintf("%s-ovfl", zName);
+      char *zIdxPath  = sqlite3_mprintf("%s-ovfl.zipidx", zName);
+      if( zDataPath && zIdxPath ){
+#ifdef LIBSQL_ZIP_OFFLINE
+        /* Offline mode: the sidecar is only created by the close-time
+        ** zipOvflOfflineCompress() bulk pass (see closeUnixFile()); attach
+        ** to it here only if a prior pass already produced one -- until
+        ** then every page (including eventual overflow pages) is read and
+        ** written completely plain, at zero VFS-level overhead. */
+        int ovflFlags = isReadonly ? O_RDONLY : O_RDWR;
+#else
+        int ovflFlags = isReadonly ? O_RDONLY : (O_RDWR|O_CREAT);
+#endif
+        int dataFd = open(zDataPath, ovflFlags, 0644);
+        int idxFd  = open(zIdxPath, ovflFlags, 0644);
+        if( dataFd>=0 && idxFd>=0 ){
+          p->zipOvflDataFd = dataFd;
+          p->zipOvflIdxFd = idxFd;
+          u32 ps = 0, np = 0;
+          if( zipIdxReadHdr(idxFd, &ps, &np) == 0 ){
+            p->zipOvflPageSize = (int)ps;
+            p->zipOvflNumPages = np;
+          }
+#if SQLITE_MAX_MMAP_SIZE>0
+          /* mmap'd xFetch() reads would bypass the classification check in
+          ** unixRead() entirely, returning raw (hole/stale) bytes for an
+          ** overflow page instead of routing through zipOvflReadPage(). */
+          p->mmapSizeMax = 0;
+#endif
+        }else{
+          if( dataFd>=0 ) close(dataFd);
+          if( idxFd>=0 ) close(idxFd);
+        }
+      }
+      sqlite3_free(zDataPath);
+      sqlite3_free(zIdxPath);
+      /* If open() fails, leave zipOvflIdxFd=-1: every page (including
+      ** overflow pages) is then read/written plain for this connection. */
+    }
+#else
     char *zIdxPath = sqlite3_mprintf("%s.zipidx", zName);
     if( zIdxPath ){
 #ifdef LIBSQL_ZIP_OFFLINE
@@ -7155,6 +7802,7 @@ open_finished:
       /* If open() fails (e.g. read-only and no index yet), leave zipIdxFd=-1
       ** and operate in normal (uncompressed) mode for this file. */
     }
+#endif /* LIBSQL_ZIP_OVFL_ONLY */
   }
 #endif /* LIBSQL_ENABLE_COMPRESSION */
   if( rc!=SQLITE_OK ){

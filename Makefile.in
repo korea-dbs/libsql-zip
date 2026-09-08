@@ -104,11 +104,22 @@ TCC += $(OPTS)
 # inserts run against a plain, uncompressed database, and the whole file
 # is compressed in a single pass at the end of the insert phase (see
 # zipOfflineCompress() in src/os_unix.c).
+#
+# By default the *whole* database is compressed (every page). Add
+# LIBSQL_ZIP_SCOPE=ovfl to build the "overflow-only" variant instead:
+# ordinary table/index pages stay plain in the main db file, and only
+# b-tree overflow pages are compressed, into a separate <db>-ovfl +
+# <db>-ovfl.zipidx sidecar pair (see the LIBSQL_ZIP_OVFL_ONLY block in
+# src/os_unix.c, and the mark/unmark hooks in src/btree.c). Combinable
+# with LIBSQL_ZIP_MODE=offline.
 ifdef LIBSQL_COMPRESS
   COMPRESS_UPPER = $(shell echo $(LIBSQL_COMPRESS) | tr '[:lower:]' '[:upper:]')
   TCC += -DLIBSQL_ENABLE_COMPRESSION -DLIBSQL_COMPRESS_$(COMPRESS_UPPER)
   ifeq ($(LIBSQL_ZIP_MODE),offline)
     TCC += -DLIBSQL_ZIP_OFFLINE
+  endif
+  ifeq ($(LIBSQL_ZIP_SCOPE),ovfl)
+    TCC += -DLIBSQL_ZIP_OVFL_ONLY
   endif
   ifeq ($(LIBSQL_COMPRESS),lz4)
     TLIBS += -llz4
