@@ -6870,6 +6870,17 @@ static SQLITE_NOINLINE int clearCellOverflow(
       */
       rc = SQLITE_CORRUPT_BKPT;
     }else{
+#ifdef LIBSQL_ZIP_OVFL_ONLY
+      /* This pgno is being returned to the freelist; it is no longer an
+      ** overflow page. Tell the VFS so a later reuse of this pgno for an
+      ** ordinary page is not misrouted into the <db>-ovfl store, and so
+      ** its old compressed slot (if any) can be reclaimed as dead space. */
+      {
+        sqlite3_file *fdHint = sqlite3PagerFile(pBt->pPager);
+        u32 pgnoHint = (u32)ovflPgno;
+        sqlite3OsFileControlHint(fdHint, SQLITE_FCNTL_ZIP_OVFL_UNMARK, &pgnoHint);
+      }
+#endif
       rc = freePage2(pBt, pOvfl, ovflPgno);
     }
 
@@ -7068,6 +7079,21 @@ static int fillInCell(
         releasePage(pToRelease);
         return rc;
       }
+
+#ifdef LIBSQL_ZIP_OVFL_ONLY
+      /* Tell the VFS's overflow-page compression layer that pgnoOvfl is,
+      ** from this point on, an overflow page -- its eventual checkpoint
+      ** write should be redirected into the compressed <db>-ovfl sidecar
+      ** instead of being written plain into the main db file. This is a
+      ** best-effort hint: if lost (e.g. a crash before the next
+      ** checkpoint), the page simply falls back to being stored plain,
+      ** with no correctness impact. */
+      {
+        sqlite3_file *fdHint = sqlite3PagerFile(pBt->pPager);
+        u32 pgnoHint = (u32)pgnoOvfl;
+        sqlite3OsFileControlHint(fdHint, SQLITE_FCNTL_ZIP_OVFL_MARK, &pgnoHint);
+      }
+#endif
 
       /* If pToRelease is not zero than pPrior points into the data area
       ** of pToRelease.  Make sure pToRelease is still writeable. */

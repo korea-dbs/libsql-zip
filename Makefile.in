@@ -95,6 +95,43 @@ TCC += $(OPT_FEATURE_FLAGS)
 # ie.  make "OPTS=-DSQLITE_ENABLE_FOO=1 -DSQLITE_OMIT_FOO=1".
 TCC += $(OPTS)
 
+# VFS-level page compression.
+# Usage: make LIBSQL_COMPRESS=lz4    (or snappy, or zstd)
+# Each compressed database gets a sidecar <db>.zipidx index file.
+#
+# By default pages are compressed "online", i.e. as each one is written.
+# Add LIBSQL_ZIP_MODE=offline to build the "offline" variant instead:
+# inserts run against a plain, uncompressed database, and the whole file
+# is compressed in a single pass at the end of the insert phase (see
+# zipOfflineCompress() in src/os_unix.c).
+#
+# By default the *whole* database is compressed (every page). Add
+# LIBSQL_ZIP_SCOPE=ovfl to build the "overflow-only" variant instead:
+# ordinary table/index pages stay plain in the main db file, and only
+# b-tree overflow pages are compressed, into a separate <db>-ovfl +
+# <db>-ovfl.zipidx sidecar pair (see the LIBSQL_ZIP_OVFL_ONLY block in
+# src/os_unix.c, and the mark/unmark hooks in src/btree.c). Combinable
+# with LIBSQL_ZIP_MODE=offline.
+ifdef LIBSQL_COMPRESS
+  COMPRESS_UPPER = $(shell echo $(LIBSQL_COMPRESS) | tr '[:lower:]' '[:upper:]')
+  TCC += -DLIBSQL_ENABLE_COMPRESSION -DLIBSQL_COMPRESS_$(COMPRESS_UPPER)
+  ifeq ($(LIBSQL_ZIP_MODE),offline)
+    TCC += -DLIBSQL_ZIP_OFFLINE
+  endif
+  ifeq ($(LIBSQL_ZIP_SCOPE),ovfl)
+    TCC += -DLIBSQL_ZIP_OVFL_ONLY
+  endif
+  ifeq ($(LIBSQL_COMPRESS),lz4)
+    TLIBS += -llz4
+  endif
+  ifeq ($(LIBSQL_COMPRESS),snappy)
+    TLIBS += -lsnappy
+  endif
+  ifeq ($(LIBSQL_COMPRESS),zstd)
+    TLIBS += -lzstd
+  endif
+endif
+
 # Add in compile-time options for some libraries used by extensions
 TCC += @HAVE_ZLIB@
 
@@ -743,6 +780,19 @@ sqlite3$(TEXE):	shell.c sqlite3.c $(OPT_WASM_RUNTIME_LIBRARY_TARGET)
 
 libsql$(TEXE):	sqlite3$(TEXE)
 		cp sqlite3$(TEXE) libsql$(TEXE)
+
+# Compression-aware shell. Links shell.c against liblibsql.la (which must
+# be built with LIBSQL_COMPRESS=lz4|snappy|zstd) instead of the sqlite3.c
+# amalgamation.  Use this binary with libsql_test_recall.py when the DB was
+# created with compression enabled.
+#
+# Build: make LIBSQL_COMPRESS=lz4 libsql-zip
+# Use:   python3 benchmark/libsql_test_recall.py --shell ./libsql-zip ...
+libsql-zip$(TEXE): shell.c liblibsql.la
+	$(LTLINK) $(READLINE_FLAGS) $(SHELL_OPT) -o $@ \
+		shell.c \
+		liblibsql.la \
+		$(LIBREADLINE) $(TLIBS) -rpath "$(libdir)"
 
 sqldiff$(TEXE):	$(TOP)/tool/sqldiff.c sqlite3.lo sqlite3.h
 	$(LTLINK) -o $@ $(TOP)/tool/sqldiff.c sqlite3.lo $(TLIBS) $(OPT_STATIC_LIBLIBSQL_WASM)

@@ -7585,12 +7585,22 @@ int sqlite3PagerCheckpoint(
     sqlite3_exec(db, "PRAGMA table_list",0,0,0);
   }
   if(pagerUseWal(pPager)){
+#ifdef LIBSQL_ENABLE_COMPRESSION
+    extern double sqlite3_zipCkptTotalMs;
+    struct timespec ckptT0, ckptT1;
+    clock_gettime(CLOCK_MONOTONIC, &ckptT0);
+#endif
     rc = pPager->wal->methods.xCheckpoint(pPager->wal->pData, db, eMode,
         (eMode==SQLITE_CHECKPOINT_PASSIVE ? 0 : pPager->xBusyHandler),
         pPager->pBusyHandlerArg,
         pPager->walSyncFlags, pPager->pageSize, (u8 *)pPager->pTmpSpace,
         pnLog, pnCkpt, NULL, NULL
     );
+#ifdef LIBSQL_ENABLE_COMPRESSION
+    clock_gettime(CLOCK_MONOTONIC, &ckptT1);
+    sqlite3_zipCkptTotalMs += (ckptT1.tv_sec - ckptT0.tv_sec) * 1000.0
+                            + (ckptT1.tv_nsec - ckptT0.tv_nsec) / 1e6;
+#endif
   }
   return rc;
 }

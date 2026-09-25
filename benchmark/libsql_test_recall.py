@@ -90,7 +90,8 @@ def main():
         args.db = args.load_db
         print(f"Using existing db: {args.db}")
     elif args.insert_sql:
-        for f in [args.db, args.db + "-wal", args.db + "-shm", args.db + "-journal"]:
+        for f in [args.db, args.db + "-wal", args.db + "-shm", args.db + "-journal",
+                  args.db + ".zipidx"]:
             if os.path.exists(f):
                 os.remove(f)
         print(f"Inserting from {args.insert_sql}...")
@@ -111,6 +112,12 @@ def main():
     else:
         print("Error: provide --insert-sql or --load-db")
         return
+
+    # --- Disk size measurement ---
+    db_bytes = os.path.getsize(args.db) if os.path.exists(args.db) else 0
+    idx_path = args.db + ".zipidx"
+    idx_bytes = os.path.getsize(idx_path) if os.path.exists(idx_path) else 0
+    total_bytes = db_bytes + idx_bytes
 
     # --- Step 2: DiskANN search ---
     print(f"Running DiskANN queries (k={args.k})...")
@@ -204,6 +211,12 @@ def main():
     print(f"  Brute-force search: {t_bf:.2f}s ({t_bf/n_queries*1e6:.0f} us/query)")
     print(f"  DiskANN hits: {total_hits} / {total_possible}")
     print(f"  Mean Recall: {recall:.4f} ({recall*100:.2f}%)")
+    print(f"  DB file:     {db_bytes/1024/1024:.1f} MB")
+    if idx_bytes > 0:
+        print(f"  .zipidx:     {idx_bytes/1024/1024:.1f} MB")
+        print(f"  Total disk:  {total_bytes/1024/1024:.1f} MB  (data + index)")
+    else:
+        print(f"  Total disk:  {total_bytes/1024/1024:.1f} MB")
     print("=" * 50)
 
 

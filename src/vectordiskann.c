@@ -2115,7 +2115,6 @@ static void diskAnnPrintInsertStats(void){
     fprintf(stderr, "    build blob read path:%7.1f ms\n", g_totalBuildReadMs);
     fprintf(stderr, "    build blob write path:%6.1f ms\n", g_totalBuildWriteMs);
     fprintf(stderr, "    build distance:%7.1f ms\n", g_totalBuildDistMs);
-    fprintf(stderr, "    LSM work during build: 0.0 ms\n");
     fprintf(stderr, "================================================\n");
   }
 }
